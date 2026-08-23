@@ -1,0 +1,77 @@
+<mujoco model="g1 fixed upper + table">
+  <include file="g1_fixed_upper.xml"/>
+  <statistic center="0.3 0 0.9" extent="1.4"/>
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.2 0.2 0.2" specular="0 0 0"/>
+    <global azimuth="120" elevation="-15"/>
+  </visual>
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="512"/>
+    <texture type="2d" name="grid" builtin="checker" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+             markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="grid" texture="grid" texuniform="true" texrepeat="5 5" reflectance="0.15"/>
+    <material name="wood" rgba="0.66 0.48 0.30 1"/>
+    <material name="plaex_yellow" rgba="1 0.9 0 1"/>
+    <!-- yellowPLAEXLong.obj from BRICK-SIMULATOR-3D-MUJOCO/BlenderFiles, raw Blender export
+         (Y-up). scale=0.015 -> 7.875 x 3.75 x 3.45 cm, a graspable tabletop-brick size
+         (the source project's own 0.1 m/unit convention is for a much larger dam-building
+         scale and isn't used here). -->
+    <mesh name="yellow_plaex_long" file="yellowPLAEXLong.obj" scale="0.015 0.015 0.015"/>
+  </asset>
+  <worldbody>
+    <geom name="floor" size="0 0 0.05" type="plane" material="grid"/>
+    <!-- Table in front of the robot (robot forward = +X). Top surface at z=0.74 -->
+    <body name="table" pos="0.55 0 0">
+      <geom name="table_top" type="box" size="0.35 0.5 0.02" pos="0 0 0.72" material="wood"/>
+      <geom name="leg1" type="box" size="0.03 0.03 0.36" pos="0.30 0.45 0.36" material="wood"/>
+      <geom name="leg2" type="box" size="0.03 0.03 0.36" pos="0.30 -0.45 0.36" material="wood"/>
+      <geom name="leg3" type="box" size="0.03 0.03 0.36" pos="-0.30 0.45 0.36" material="wood"/>
+      <geom name="leg4" type="box" size="0.03 0.03 0.36" pos="-0.30 -0.45 0.36" material="wood"/>
+    </body>
+
+    <!-- Three yellowPLAEXLong bricks resting on the table (top at z=0.74), side by
+         side along Y, within arm reach (x~0.45), each at a different yaw so they
+         aren't just a repeated copy-paste row. Free bodies for teleop pick/stack.
+         The mesh's local axes need a fixed +90deg-about-X correction (Blender Y-up
+         -> MuJoCo Z-up, see BRICK-SIMULATOR-3D-MUJOCO/CLAUDE.md); expressed as a
+         quat (not euler) because this document's compiler angle="radian" and a
+         quat sidesteps any degrees/radians ambiguity. Body quat carries the yaw. -->
+    <body name="brick1" pos="0.45 -0.15 0.758">
+      <freejoint/>
+      <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
+            quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
+      <geom name="brick1_collision" type="box" size="0.039375 0.01875 0.01725"
+            pos="-0.001875 0 0.00225" density="600" group="3"/>
+    </body>
+    <body name="brick2" pos="0.45 0 0.758" quat="0.7071068 0 0 0.7071068">
+      <freejoint/>
+      <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
+            quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
+      <geom name="brick2_collision" type="box" size="0.039375 0.01875 0.01725"
+            pos="-0.001875 0 0.00225" density="600" group="3"/>
+    </body>
+    <body name="brick3" pos="0.45 0.18 0.758" quat="0.9659258 0 0 0.258819">
+      <freejoint/>
+      <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
+            quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
+      <geom name="brick3_collision" type="box" size="0.039375 0.01875 0.01725"
+            pos="-0.001875 0 0.00225" density="600" group="3"/>
+    </body>
+  </worldbody>
+
+  <!-- g1_fixed_upper.xml's own "stand" keyframe is robot-only (43 qpos values,
+       g1_with_hands.xml source: 29 body + 14 Dex3-1 finger joints). MuJoCo
+       auto-pads it to this scene's nq=64 with zero/identity for the brick free
+       joints, which resets every brick to the world origin -- not the table.
+       This keyframe gives the full scene (robot + 3 bricks) a correct reset
+       point; stand_next_to_table.py looks it up by name instead of index 0.
+       Robot qpos/ctrl values copied verbatim from g1_fixed_upper.xml's "stand". -->
+  <keyframe>
+    <key name="stand_at_table"
+      qpos="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.2 0.2 0 1.28 0 0 0 0 1.05 0 0 0 0 0 0.2 -0.2 0 1.28 0 0 0 0 -1.05 0 0 0 0 0
+            0.45 -0.15 0.758 1 0 0 0
+            0.45 0 0.758 0.7071068 0 0 0.7071068
+            0.45 0.18 0.758 0.9659258 0 0 0.258819"
+      ctrl="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.2 0.2 0 1.28 0 0 0 0 1.05 0 0 0 0 0 0.2 -0.2 0 1.28 0 0 0 0 -1.05 0 0 0 0 0"/>
+  </keyframe>
+</mujoco>
