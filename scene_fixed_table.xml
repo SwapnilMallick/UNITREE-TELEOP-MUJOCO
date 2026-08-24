@@ -30,32 +30,58 @@
     </body>
 
     <!-- Three yellowPLAEXLong bricks resting on the table (top at z=0.74), side by
-         side along Y, within arm reach (x~0.45), each at a different yaw so they
-         aren't just a repeated copy-paste row. Free bodies for teleop pick/stack.
+         side along Y, each at a different yaw so they aren't just a repeated
+         copy-paste row. Free bodies for teleop pick/stack.
+         x=0.28 (not the table's visual center) -- verify_arm_ik.py's reachability
+         check found the arm's true max reach is ~0.499 m (joint-limited, measured,
+         less than the naive fully-outstretched estimate of 0.530 m), and x=0.45
+         put targets at ~0.56 m from the shoulder: physically outside the arm's
+         workspace, confirmed by the IK solver saturating exactly at max reach
+         along the line to the target. x=0.28 puts all three ~0.43-0.44 m out,
+         with margin under 0.499 m. Re-run verify_arm_ik.py if bricks move again.
+         brick2's y moved from 0 (dead center) to -0.07: at y=0, reaching it
+         required the right (or left) shoulder to rotate across the body's own
+         centerline, producing a real torso/shoulder self-collision for BOTH
+         arms and leaving the physically-simulated gripper site ~4.4cm off
+         target (vs a 2cm tolerance) even though the IK solve itself converged
+         fine -- confirmed the pregrasp height wasn't the cause (self-collision
+         persisted up to 20cm above the brick) and that only a lateral shift
+         resolved it. At y=-0.07 the right arm reaches it with the self-collision
+         gone and ~1.6cm error; confirmed no brick1<->brick2 collision-geom
+         overlap at rest. See CLAUDE.md's "Arm IK" section.
          The mesh's local axes need a fixed +90deg-about-X correction (Blender Y-up
          -> MuJoCo Z-up, see BRICK-SIMULATOR-3D-MUJOCO/CLAUDE.md); expressed as a
          quat (not euler) because this document's compiler angle="radian" and a
-         quat sidesteps any degrees/radians ambiguity. Body quat carries the yaw. -->
-    <body name="brick1" pos="0.45 -0.15 0.758">
+         quat sidesteps any degrees/radians ambiguity. Body quat carries the yaw.
+
+         Each brick's collision geom carries friction="3 0.5 0.3" solref="0.005 1",
+         matching the Dex3-1 fingertip geoms tuned in make_fixed_base.py -- the two
+         sides of the same contact pair, tuned together against a real grasp+lift+hold
+         test (verify_grasp_hold.py), not independently. See CLAUDE.md's "Grasp
+         Primitive" section. -->
+    <body name="brick1" pos="0.28 -0.15 0.758">
       <freejoint/>
       <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
             quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
       <geom name="brick1_collision" type="box" size="0.039375 0.01875 0.01725"
-            pos="-0.001875 0 0.00225" density="600" group="3"/>
+            pos="-0.001875 0 0.00225" density="600" group="3"
+            friction="3 0.5 0.3" solref="0.005 1"/>
     </body>
-    <body name="brick2" pos="0.45 0 0.758" quat="0.7071068 0 0 0.7071068">
+    <body name="brick2" pos="0.28 -0.07 0.758" quat="0.7071068 0 0 0.7071068">
       <freejoint/>
       <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
             quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
       <geom name="brick2_collision" type="box" size="0.039375 0.01875 0.01725"
-            pos="-0.001875 0 0.00225" density="600" group="3"/>
+            pos="-0.001875 0 0.00225" density="600" group="3"
+            friction="3 0.5 0.3" solref="0.005 1"/>
     </body>
-    <body name="brick3" pos="0.45 0.18 0.758" quat="0.9659258 0 0 0.258819">
+    <body name="brick3" pos="0.28 0.18 0.758" quat="0.9659258 0 0 0.258819">
       <freejoint/>
       <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
             quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
       <geom name="brick3_collision" type="box" size="0.039375 0.01875 0.01725"
-            pos="-0.001875 0 0.00225" density="600" group="3"/>
+            pos="-0.001875 0 0.00225" density="600" group="3"
+            friction="3 0.5 0.3" solref="0.005 1"/>
     </body>
   </worldbody>
 
@@ -69,9 +95,9 @@
   <keyframe>
     <key name="stand_at_table"
       qpos="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.2 0.2 0 1.28 0 0 0 0 1.05 0 0 0 0 0 0.2 -0.2 0 1.28 0 0 0 0 -1.05 0 0 0 0 0
-            0.45 -0.15 0.758 1 0 0 0
-            0.45 0 0.758 0.7071068 0 0 0.7071068
-            0.45 0.18 0.758 0.9659258 0 0 0.258819"
+            0.28 -0.15 0.758 1 0 0 0
+            0.28 -0.07 0.758 0.7071068 0 0 0.7071068
+            0.28 0.18 0.758 0.9659258 0 0 0.258819"
       ctrl="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.2 0.2 0 1.28 0 0 0 0 1.05 0 0 0 0 0 0.2 -0.2 0 1.28 0 0 0 0 -1.05 0 0 0 0 0"/>
   </keyframe>
 </mujoco>

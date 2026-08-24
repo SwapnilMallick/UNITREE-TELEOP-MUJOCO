@@ -1,0 +1,19 @@
+brick2 reachability check — extend verify_arm_ik.py to also confirm the center brick (y=0) is reachable, and decide which arm takes it (currently ambiguous — both arms could reach it). Cheap, reuses existing infrastructure, resolves an open assignment question before anything downstream depends on it.
+
+Grasp primitive — define open / pre-grasp / closed joint configurations for the Dex3-1 hand (a single 0→1 grip scalar interpolating between them, not full per-finger IK), plus an approach orientation for each grasp (new — position-only IK never decided how the hand should be oriented relative to the brick when closing). Watch for the known thumb/wrist self-collision (0.27mm, pre-existing in the stock keyframe) once fingers actually close instead of sitting open.
+
+Promote the approach path into a reusable module — the up/over/down waypoint logic currently only exists as test scaffolding inside verify_arm_ik.py, built for one static target. Needs to become a re-targetable component (any start → any goal) before the control loop can call it per pick/place, not copy-paste it per case. 
+
+Tune fingertip–brick contact — friction/solref/solimp on the Dex3-1 fingertip collision geoms and the brick's collision box, tuned until contact-only holding (the already-decided strategy) actually survives a lift. This is real iteration, not a one-shot guess.
+
+Grasp-state detection — since holding is contact-only (not weld-on-detect), "is it grasped" has to come from something like fingertip-to-brick proximity + hand aperture, not a simple binary flag. Gates the pick→lift transition.
+
+Collision avoidance against the other bricks (new — not in your original 8) — the waypoint path was only proven clear of the table. Once a brick is moving, the same path needs to clear the two still sitting on the table, and later the partially-built stack. Extend #3's module rather than assume the table-only clearance still holds.
+
+Wire into stand_next_to_table.py's live control loop — assemble IK + reusable approach path + grasp primitive + grasp-state detection into the per-frame loop, replacing the placeholder d.ctrl[UPPER_BODY] = hold[UPPER_BODY] line. Driven by a scripted target sequence for now (Phase 2 swaps in real VR/keyboard input later) — matches the pattern verify_arm_ik.py already established.
+
+Stacking sequencing — decide the stack location, per-brick pick order, and arm assignment (including brick2, resolved in #1). This is also what determines the place-side targets needed next.
+
+Place-location reachability check (split out from your original "reachability check," deferred half) — now that #8 fixes the stack destination, confirm IK can actually reach each placement pose, same way #1 confirmed the pick poses.
+
+Final headless end-to-end verification — scripted full pick→lift→move→place→release for all three bricks; assert final tower geometry (stacked, aligned within tolerance), no NaNs, pelvis undisturbed, contact-only grip survives each release.
