@@ -28,6 +28,13 @@ since no headset is reachable from this dev environment).
                                                           # controller triggers (see
                                                           # teleop_control.py's HandRetargeter)
     python stand_next_to_table.py --view third_person /path/to/scene.xml
+    python stand_next_to_table.py --pick brick1 --record-episodes recordings/pick_brick1
+                                                          # also records frames+joint states/
+                                                          # actions per step via EpisodeRecorder
+                                                          # (episode_recording.py) -- works with
+                                                          # any driver (--pick, --teleop, ...),
+                                                          # runs in parallel, not wired into any
+                                                          # of them
 """
 import argparse, time, pathlib, os
 import numpy as np
@@ -36,6 +43,7 @@ import mujoco, mujoco.viewer
 from actuator_groups import LEG, WAIST, LEFT_ARM, LEFT_HAND, RIGHT_ARM, RIGHT_HAND, UPPER_BODY
 from pick_sequence import PickSequence
 from teleop_control import TeleopController, FpvStreamer, HandRetargeter
+from episode_recording import EpisodeRecorder
 
 # Only brick1/brick2 (right arm) are verified reliable -- see
 # verify_grasp_hold.py and CLAUDE.md's "Fingertip/Brick Contact Tuning".
@@ -101,6 +109,30 @@ def parse_args():
                               "forked pin -- see teleop_control.py's HandRetargeter docstring) "
                               "plus CPU torch. Default is controller mode (a trigger's grip "
                               "scalar), matching the locked-in teleop design decision.")
+    parser.add_argument("--record-episodes", type=pathlib.Path, default=None, metavar="DIR",
+                         help="also record frames + joint states/actions per step via "
+                              "EpisodeRecorder (episode_recording.py), into DIR in "
+                              "xr_teleoperate's own per-episode data.json format. Works "
+                              "alongside any driver (--pick, --teleop, or --pick none) -- "
+                              "runs in parallel, not wired into any of them. Off by default.")
+    parser.add_argument("--teleop-debug", action="store_true",
+                         help="with --teleop, print calibration + per-frame IK diagnostics "
+                              "(captured reference poses, |pos_delta|, IK target, residual) "
+                              "-- for diagnosing the arm not following the controller. "
+                              "Off by default.")
+    parser.add_argument("--teleop-orientation", action="store_true",
+                         help="with --teleop, add 6-DOF IK following controller ORIENTATION. "
+                              "EXPERIMENTAL / poor: arm_ik's solver maps a controller "
+                              "rotation to a wildly axis-dependent gripper rotation and "
+                              "degrades position 10-25cm -- gives some orientation influence "
+                              "but not faithful control (needs a weighted IK). Default is "
+                              "position-only.")
+    parser.add_argument("--teleop-scale", type=float, default=None, metavar="S",
+                         help="with --teleop, controller-motion -> robot-motion scale "
+                              "(default: teleop_control.SCALE = 0.5). The operator's arm "
+                              "range is bigger than this arm's ~0.45m envelope, so <1.0 "
+                              "keeps targets reachable. Lower if the arm still hits limits; "
+                              "raise toward 1.0 if motion feels sluggish.")
     return parser.parse_args()
 
 def main():
@@ -173,7 +205,11 @@ def main():
                     "  pip install dex_retargeting\n"
                     "  pip install torch --index-url https://download.pytorch.org/whl/cpu"
                 ) from e
-        teleop_ctrl = TeleopController(m, hand_retargeter=hand_retargeter)
+        teleop_kw = dict(hand_retargeter=hand_retargeter, debug=args.teleop_debug,
+                         track_orientation=args.teleop_orientation)
+        if args.teleop_scale is not None:
+            teleop_kw["scale"] = args.teleop_scale   # else TeleopController's own default
+        teleop_ctrl = TeleopController(m, **teleop_kw)
         fpv_streamer = (FpvStreamer(m, EGOCENTRIC_CAMERA)
                          if args.display_mode != "pass-through" else None)
         print(f"teleop: waiting for headset connection + first "
@@ -184,62 +220,141 @@ def main():
         seq.start(m, d)
         print(f"picking {brick_name} with the {side} arm...")
 
-    with mujoco.viewer.launch_passive(m, d) as viewer:
+    # EpisodeRecorder runs in PARALLEL to whatever drives the arms above
+    # (--teleop / --pick / --pick none) -- it only READS the live MjData each
+    # step and never touches d.ctrl, so it records identically regardless of
+    # the driver. See episode_recording.py.
+    recorder = None
+    episode_n = 1
+    record_state = {"want_next": False, "awaiting_next": False}
+    calib_state = {"waiting_printed": False}  # for the 'hold still to calibrate' hint
+    if args.record_episodes is not None:
+        if args.teleop:
+            episode_goal = f"teleop ({'hand-tracking' if args.hand_tracking else 'controllers'})"
+        elif args.pick != "none":
+            episode_goal = f"pick {args.pick} with the {PICK_TARGETS[args.pick][0]} arm"
+        else:
+            episode_goal = "hold stance"
+        recorder = EpisodeRecorder(m, task_dir=str(args.record_episodes),
+                                    goal=episode_goal,
+                                    extra_bodies=list(PICK_TARGETS))  # brick1/2/3 ground truth
+        if not recorder.start_episode():
+            raise SystemExit(f"could not start recording in {args.record_episodes}/ "
+                              f"(EpisodeWriter reported busy at startup -- unexpected)")
+        print(f"recording episode {episode_n} into {args.record_episodes}/ -- press 'n' in "
+              f"the viewer window to save it and begin the next take")
+
+    def key_callback(keycode):
+        # GLFW reports letter keys as their uppercase ASCII code.
+        # 'n' -> finalize the current episode and start a fresh one, so one
+        #        session can capture many takes without restarting the sim.
+        # 'c' -> drop teleop calibration and re-capture a fresh reference,
+        #        so a bad initial capture is recoverable without a restart.
+        if recorder is not None and keycode == ord("N"):
+            record_state["want_next"] = True
+        if teleop_ctrl is not None and keycode == ord("C"):
+            teleop_ctrl.request_recalibration()
+            calib_state["waiting_printed"] = False
+            print("\nteleop: re-calibrating -- hold both controllers still for a moment")
+
+    with mujoco.viewer.launch_passive(m, d, key_callback=key_callback) as viewer:
         if args.view == "egocentric":
             viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
             viewer.cam.fixedcamid = m.camera(EGOCENTRIC_CAMERA).id
 
         last_phase = None
-        while viewer.is_running():
-            t0 = time.time()
-            if teleop_ctrl is not None:
-                data = tele_source.get_tele_data()
-                if not teleop_ctrl.calibrated:
-                    if data.motion_data_ready:
-                        teleop_ctrl.calibrate(m, d, data)
-                        print("teleop: calibrated -- both arms now follow the controllers")
+        # try/finally so the in-progress episode is flushed to disk (and the
+        # writer's non-daemon worker thread joined) on a viewer close, an
+        # exception, or Ctrl-C -- without close() the process would hang on
+        # exit waiting for that thread.
+        try:
+            while viewer.is_running():
+                t0 = time.time()
+                if teleop_ctrl is not None:
+                    data = tele_source.get_tele_data()
+                    if not teleop_ctrl.calibrated:
+                        # Gated: try_calibrate captures the reference only once the
+                        # controllers report a stable, non-stale pose for a moment
+                        # (see TeleopController.try_calibrate -- calibrating on a
+                        # stale first frame is the cause of the intermittent "arm
+                        # won't follow" failure). Until then, freeze the arms where
+                        # they are; legs/waist stay pinned to stance.
+                        if teleop_ctrl.try_calibrate(m, d, data):
+                            print("teleop: calibrated -- arms ramping to the ready pose, "
+                                  "then following the controllers")
+                            if teleop_ctrl.calib_warning:
+                                print(f"teleop: !! {teleop_ctrl.calib_warning} -- hold a "
+                                      f"relaxed, symmetric pose (hands in front of your chest, "
+                                      f"~30cm apart) and press 'c' to re-calibrate")
+                            calib_state["waiting_printed"] = False
+                        else:
+                            d.ctrl[LEG]   = hold[LEG]
+                            d.ctrl[WAIST] = hold[WAIST]
+                            if not calib_state["waiting_printed"]:
+                                print("teleop: hold both controllers still to calibrate...")
+                                calib_state["waiting_printed"] = True
                     else:
-                        d.ctrl[:] = hold  # keep pinned to stance until calibrated
+                        # TeleopController.step() lays down hold_ctrl for the WHOLE
+                        # array first, same contract as PickSequence.step() -- see
+                        # teleop_control.py
+                        teleop_ctrl.step(m, d, hold, data)
+                        if args.hand_tracking:
+                            # last_grip is None per side in hand-tracking mode --
+                            # there's no single scalar, real per-finger joints instead
+                            print("  hand-tracking: retargeting live", end="\r")
+                        else:
+                            print(f"  grip L={teleop_ctrl.last_grip['left']:.2f} "
+                                  f"R={teleop_ctrl.last_grip['right']:.2f}", end="\r")
+                    if fpv_streamer is not None:
+                        # streams regardless of calibration state -- the operator
+                        # should be able to see the robot's view even before their
+                        # controllers are tracked; internally rate-limited, most
+                        # calls are a no-op (see FpvStreamer)
+                        fpv_streamer.step(d, tele_source)
+                elif seq is None:
+                    # --pick none: old behavior, just hold the stance every step
+                    d.ctrl[LEG]   = hold[LEG]
+                    d.ctrl[WAIST] = hold[WAIST]
+                    d.ctrl[UPPER_BODY] = hold[UPPER_BODY]
                 else:
-                    # TeleopController.step() lays down hold_ctrl for the WHOLE
-                    # array first, same contract as PickSequence.step() -- see
-                    # teleop_control.py
-                    teleop_ctrl.step(m, d, hold, data)
-                    if args.hand_tracking:
-                        # last_grip is None per side in hand-tracking mode --
-                        # there's no single scalar, real per-finger joints instead
-                        print("  hand-tracking: retargeting live", end="\r")
-                    else:
-                        print(f"  grip L={teleop_ctrl.last_grip['left']:.2f} "
-                              f"R={teleop_ctrl.last_grip['right']:.2f}", end="\r")
-                if fpv_streamer is not None:
-                    # streams regardless of calibration state -- the operator
-                    # should be able to see the robot's view even before their
-                    # controllers are tracked; internally rate-limited, most
-                    # calls are a no-op (see FpvStreamer)
-                    fpv_streamer.step(d, tele_source)
-            elif seq is None:
-                # --pick none: old behavior, just hold the stance every step
-                d.ctrl[LEG]   = hold[LEG]
-                d.ctrl[WAIST] = hold[WAIST]
-                d.ctrl[UPPER_BODY] = hold[UPPER_BODY]
-            else:
-                # PickSequence.step() lays down hold_ctrl for the WHOLE array
-                # first, then overwrites only its own arm_slice/hand_slice --
-                # so LEG/WAIST and the other arm/hand stay pinned to stance
-                # without a separate write here.
-                phase = seq.step(m, d, hold)
-                if phase != last_phase:
-                    print(f"  phase: {phase}")
-                    last_phase = phase
-                if phase == "HOLD" and seq.confidence is not None:
-                    print(f"    grasped={seq.confidence['grasped']}  "
-                          f"confidence={seq.confidence['confidence']:.2f}", end="\r")
-            mujoco.mj_step(m, d)
-            viewer.sync()
-            dt = m.opt.timestep - (time.time() - t0)
-            if dt > 0:
-                time.sleep(dt)
+                    # PickSequence.step() lays down hold_ctrl for the WHOLE array
+                    # first, then overwrites only its own arm_slice/hand_slice --
+                    # so LEG/WAIST and the other arm/hand stay pinned to stance
+                    # without a separate write here.
+                    phase = seq.step(m, d, hold)
+                    if phase != last_phase:
+                        print(f"  phase: {phase}")
+                        last_phase = phase
+                    if phase == "HOLD" and seq.confidence is not None:
+                        print(f"    grasped={seq.confidence['grasped']}  "
+                              f"confidence={seq.confidence['confidence']:.2f}", end="\r")
+                mujoco.mj_step(m, d)
+
+                if recorder is not None:
+                    # 'n' key -> save this take and roll to the next. create_episode()
+                    # is async (returns False while the previous save drains), so retry
+                    # each frame until it takes.
+                    if record_state["want_next"]:
+                        recorder.end_episode()
+                        record_state["want_next"] = False
+                        record_state["awaiting_next"] = True
+                    if record_state["awaiting_next"] and recorder.start_episode():
+                        record_state["awaiting_next"] = False
+                        episode_n += 1
+                        print(f"\nrecording episode {episode_n} into {args.record_episodes}/")
+                    # one sample per control step; internally rate-limited to the
+                    # writer's fps, so most calls are a no-op (see EpisodeRecorder)
+                    recorder.step(m, d)
+
+                viewer.sync()
+                dt = m.opt.timestep - (time.time() - t0)
+                if dt > 0:
+                    time.sleep(dt)
+        finally:
+            if recorder is not None:
+                recorder.end_episode()
+                recorder.close()
+                print(f"\nepisode recording(s) saved under {args.record_episodes}/")
 
 if __name__ == "__main__":
     # televuer spawns its own server as a child process. Python's multiprocessing

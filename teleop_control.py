@@ -47,6 +47,23 @@ right arm's bricks at -y and the left arm's brick at +y -- consistent with
 "y left"). Reasonable, not verified -- axis handedness bugs are exactly the
 kind of thing that only shows up against a real headset.
 
+Calibration is GATED (TeleopController.try_calibrate): the reference pose is
+captured only once both controllers report a valid (finite, non-identity)
+pose that has held still for CALIB_SETTLE_TIME. On calibrate() the robot side
+is anchored to TELEOP_HOME (a fixed mid-workspace pose), NOT the arm's current
+stance pose -- so the arm visibly RAMPS UP from stance to a "ready" pose out
+in front when "teleop: calibrated" prints, and the operator's neutral hand
+pose then maps to HOME with range in every direction. Still hold a RELAXED,
+SYMMETRIC controller pose at calibration (elbows ~90 deg, hands in front of
+your chest ~30cm apart, level): a lopsided one maps normal hand positions to
+cramped/unreachable targets (calibration_data_2.txt: left controller was 50cm
+more forward + 56cm more left than the right -> left arm never followed).
+calibrate() prints "[calib] WARNING: controllers asymmetric" and sets
+self.calib_warning when it detects this. If the arm ends up parked and
+unresponsive, press 'c' in the viewer to drop the calibration and re-capture,
+and/or re-run with --teleop-debug to see the reference and per-frame IK
+target/residual.
+
 First real-hardware checks, before trusting this for anything real:
 1. With the robot at stance and the controller held still, calibrate, then
    move the controller straight up a few cm. The arm should rise, not
@@ -54,10 +71,19 @@ First real-hardware checks, before trusting this for anything real:
 2. Squeeze the trigger fully with the hand empty; confirm the fingers
    actually reach CLOSED (grip=1.0), not stuck partway, given the
    10.0->0.0 raw value's inversion below.
-3. SCALE=1.0 (below) assumes roughly human-arm-scale controller motion
-   maps 1:1 onto this robot's own (also roughly human-scale) reach --
-   untested; if the mapped motion feels too twitchy or too sluggish,
-   retune SCALE first before suspecting anything else.
+3. SCALE (below, default 0.5) compresses the operator's arm range into this
+   arm's smaller ~0.49m envelope -- at 1.0, normal reaching/folding pushed the
+   IK target out of the workspace and the divergence guard froze the arm
+   (confirmed on hardware, calibration_data.txt). Tune via --teleop-scale:
+   lower if the arm still hits its limits, raise toward 1.0 if motion feels
+   sluggish.
+4. The IK target is clamped to REACH_RADIUS (below) around the shoulder, so a
+   controller reaching past the arm's envelope pins at the edge instead of
+   diverging. With the TELEOP_HOME anchor, HOME sits ~0.35m from the shoulder
+   and the brick grasp poses ~0.40m -- so from HOME the table is only a small
+   forward+down move (a few cm of gripper travel, ~10cm of controller travel at
+   scale 0.5). Move gradually; if "[teleop] ... reaching past the arm's
+   envelope" prints you've pushed past the edge -- come back toward centre.
 
 FpvStreamer (below) is the separate, previously-out-of-scope piece: pushing
 stand_next_to_table.py's fpv_teleop camera view back to the headset, so the
@@ -106,7 +132,85 @@ from arm_ik import ArmIK
 from grasp_primitive import hand_ctrl
 from actuator_groups import LEFT_ARM, LEFT_HAND, RIGHT_ARM, RIGHT_HAND
 
-SCALE = 1.0  # controller-motion -> robot-motion scale factor; untested, see above
+SCALE = 0.5  # controller-motion -> robot-motion scale factor. A human's arm reach
+             # (~0.7m + torso rotation) is bigger than this arm's ~0.49m envelope,
+             # so at 1.0 a normal reach/fold pushes the IK target outside the
+             # workspace and the divergence guard freezes the arm (confirmed on
+             # hardware -- see calibration_data.txt). 0.5 compresses the operator's
+             # range into the robot's; raise toward 1.0 if motion feels sluggish.
+             # Per-run override: stand_next_to_table.py --teleop-scale.
+
+# The delta mapping is anchored at calibration to TELEOP_HOME, NOT the current
+# (stance) gripper pose. At stance the arm hangs nearly fully extended (~0.489m
+# of ~0.499m reach), so anchoring there left almost no outward range -- any
+# outward hand motion immediately clipped the REACH_RADIUS sphere and the arm
+# looked frozen (calibration_data_4.txt: left arm tracked to sub-mm resid but was
+# pinned at the edge every frame). TELEOP_HOME is a mid-workspace pose (~0.35m
+# from the shoulder, out front at ~table height) so the operator has ~0.14m of
+# range in every direction, and "reach to a brick" is a small forward+down move.
+# calibrate() also ramps the arm from stance to here. Verified reachable to ~1cm
+# under the per-frame re-solve drive, collision-free.
+TELEOP_HOME = {"left": (0.24, 0.14, 0.82), "right": (0.24, -0.14, 0.82)}  # world frame
+# The orientation (site quat, wxyz) the arm actually SETTLES at when driven to
+# TELEOP_HOME by the per-frame re-solve -- measured, not a bare IK solve (which
+# gives a different wrist config). --teleop-orientation uses this as the
+# reference so a zero controller-rotation delta holds HOME cleanly instead of
+# fighting between the position and a wrong orientation target.
+TELEOP_HOME_QUAT = {"left":  (0.507,  -0.5578, 0.5105,  0.4138),
+                    "right": (0.5061,  0.5585, 0.5113, -0.4129)}
+
+# --- calibration gating (see TeleopController.try_calibrate) ---
+# calibrate() captures the paired reference the ENTIRE delta mapping is built
+# on. If it fires on a frame where the headset is still reporting a stale/default
+# wrist pose (identity or zeros -- connection up, but controller tracking not
+# locked on yet), every later step() computes a huge constant pos_delta and the
+# IK target sits permanently out of reach, so the arm parks at a joint limit and
+# barely responds. That race is the cause of the intermittent "the arm won't
+# follow the controller, but it worked last run" failure. The gate below only
+# captures once both controllers report a finite, non-identity pose that has
+# held still for CALIB_SETTLE_TIME.
+CALIB_SETTLE_TIME = 0.25     # s the operator must hold the controllers ~still,
+                              # with valid tracking, before the reference is taken
+CALIB_STABILITY_TOL = 0.03    # m; max controller travel between consecutive frames
+                              # to still count as "settled"
+REACH_RADIUS = 0.49          # m; the IK target is clamped to this sphere around the
+                              # shoulder -- a big controller excursion then pins at the
+                              # nearest REACHABLE point instead of diverging. Measured max
+                              # reach ~0.499m, stance is ~0.489m shoulder->gripper (arm
+                              # hangs nearly straight), so 0.49 keeps stance inside (no
+                              # startup twitch) while clamping a raised-arm lunge. The
+                              # brick grasp targets sit ~0.40m from the shoulder, inside.
+MAX_TARGET_DELTA = 0.50       # m; secondary guard -- an IK target this far from the
+                              # calibration reference means the reference is probably bad
+                              # (stale controller at calibration); clamped and logged
+
+# --- input filtering (see TeleopController._filter_vr / step) ---
+# Real Quest controller tracking drops out constantly when the controllers leave
+# the headset cameras' view (which they do in immersive mode -- the operator is
+# looking at the FPV stream, not their hands): the pose freezes at its last value
+# for a stretch, then SNAPS 30-60cm when re-acquired. Fed raw into IK + the
+# kp=500 position actuators, those snaps slam the arm and the sim diverges (IK
+# residual blows past 0.5m and never recovers). So: reject single-frame glitches,
+# EMA-smooth what's left, and rate-limit how fast the IK target may translate.
+# (xr_teleoperate ships weighted_moving_filter.py for the same reason.)
+IK_ITERS = 8                 # per-frame IK iterations (was 4) -- track a moving target better
+TELEOP_ORI_WEIGHT = 0.4      # --teleop-orientation (EXPERIMENTAL) only. arm_ik's DLS solver
+                              # behaves erratically under a 6-DOF task at these tabletop poses
+                              # -- measured: a 60deg controller rotation produces anywhere from
+                              # ~25 to ~140deg of gripper rotation depending on axis, and
+                              # position degrades 10-25cm. No weight tested fixes it. Real
+                              # grasp-alignment orientation needs a weighted (Pinocchio/CasADi)
+                              # IK, not this. This weight is just "least bad".
+VR_FILTER_ALPHA = 0.2        # EMA weight on the new (accepted) controller pose each frame
+VR_GLITCH_TOL = 0.10         # m; a single-frame controller jump larger than this is a
+                              # tracking dropout/reacquire, not a hand -- rejected, hold last
+VR_GLITCH_HOLD_TIME = 0.4    # s; if the rejected pose persists this long it's a real move
+                              # (or the controller was set down and repositioned) -- re-seat
+TARGET_MAX_SPEED = 2.0       # m/s; cap on IK-target translation speed. A burst of accepted
+                              # motion (or a filter re-seat) then ramps in over ~0.1-0.2s
+                              # instead of hitting the actuators as a step
+DIVERGENCE_RESID = 0.15      # m; post-solve site-to-target error above this, sustained,
+                              # means the arm has destabilised -- warn once, suggest 'c'
 
 # Vendored, adapted Dex3 retargeting config -- see HandRetargeter's docstring
 DEX3_RETARGETING_DIR = pathlib.Path(__file__).resolve().parent / "dex3_retargeting"
@@ -170,9 +274,9 @@ class TeleopController:
         ...
         while running:
             data = source.get_tele_data()          # real televuer or a stub
-            if not ctrl.calibrated and data.motion_data_ready:
-                ctrl.calibrate(m, d, data)
-            elif ctrl.calibrated:
+            if not ctrl.calibrated:
+                ctrl.try_calibrate(m, d, data)     # gated -- see try_calibrate
+            else:
                 ctrl.step(m, d, hold_ctrl, data)
             mujoco.mj_step(m, d)
 
@@ -180,9 +284,19 @@ class TeleopController:
     laying down hold_ctrl for everything else) -- never broadcasts across
     the full 43-actuator range, matching every other module here. LEG/WAIST
     stay pinned by hold_ctrl exactly like PickSequence.step() does.
+
+    Real Quest controller poses are noisy and drop out constantly (the pose
+    freezes then SNAPS 30-60cm when the controller leaves the headset
+    cameras' view). step() runs them through _filter_vr (single-frame glitch
+    rejection + EMA smoothing) and then rate-limits how fast the IK target
+    may move (TARGET_MAX_SPEED), so a snap can't slam the position actuators
+    and destabilise the arm; a sustained un-converged residual makes step()
+    hold the arm in place until the input settles. IK is position-only by
+    default (track_orientation) -- see __init__.
     """
 
-    def __init__(self, m, hand_retargeter=None):
+    def __init__(self, m, hand_retargeter=None, debug=False, track_orientation=False,
+                 scale=SCALE):
         """hand_retargeter, if given (a HandRetargeter instance), switches
         hand control from the controller-trigger path (hand_ctrl/
         trigger_to_grip) to real per-finger retargeting from tele_data's
@@ -190,56 +304,315 @@ class TeleopController:
         source actually supplies hand-tracking data (TeleVuerWrapper's own
         use_hand_tracking=True), not controller data. Omitting it (the
         default) preserves the original controller-trigger behavior exactly
-        -- every existing call site is unaffected."""
+        -- every existing call site is unaffected.
+
+        debug=True prints the calibration reference poses once captured, and
+        a throttled per-second line of vr_pos / |pos_delta| / IK target /
+        residual from step() -- for diagnosing the arm not tracking.
+
+        track_orientation=False (default) runs POSITION-ONLY IK. True adds a
+        6-DOF solve following the controller's rotation-since-calibration --
+        **EXPERIMENTAL and known to be poor**: arm_ik's DLS solver is erratic
+        under a 6-DOF task at these tabletop poses (a controller rotation maps
+        to a wildly axis-dependent gripper rotation, and position degrades
+        10-25cm). It gives the operator *some* orientation influence but not
+        faithful control. Real grasp-alignment orientation needs a weighted
+        (Pinocchio/CasADi) IK replacing arm_ik -- see TELEOP_ORI_WEIGHT.
+
+        scale (default SCALE) is the controller-motion -> robot-motion factor;
+        step()'s own scale= arg still overrides per call."""
         self._iks = {side: ArmIK(m, site_name, arm_slice)
                      for side, site_name, arm_slice, _ in _SIDES}
+        # body that carries each arm's first joint -- the shoulder anchor the
+        # REACH_RADIUS workspace clamp is centred on (fixed: base welded, torso
+        # pinned, so captured once in calibrate() from the live d.xpos)
+        self._shoulder_bid = {side: int(m.jnt_bodyid[self._iks[side]._joint_ids[0]])
+                              for side, _, _, _ in _SIDES}
+        self._shoulder_pos = {}
         self._hand_slices = {side: hand_slice for side, _, _, hand_slice in _SIDES}
         self._hand_retargeter = hand_retargeter
+        self._debug = debug
+        self._track_orientation = track_orientation
+        self._scale = float(scale)
+        self._dt = m.opt.timestep
+        self._steps_per_sec = max(int(round(1.0 / m.opt.timestep)), 1)
+        self._calib_need = max(int(round(CALIB_SETTLE_TIME * self._steps_per_sec)), 1)
+        self._diverge_need = max(int(round(0.3 / self._dt)), 1)  # ~0.3s sustained
+        self._calib_streak = 0
+        self._calib_prev_vr_pos = {}
+        self._step_i = 0
         self._robot_ref_pos = {}
         self._robot_ref_quat = {}
         self._vr_ref_pos = {}
         self._vr_ref_quat = {}
+        # input-filter state, (re)initialised in calibrate()
+        self._vr_pos_prev = {}     # last RAW controller pos, for glitch detection
+        self._vr_pos_filt = {}     # EMA-smoothed controller pos actually used
+        self._vr_quat_filt = {}    # EMA-smoothed controller quat actually used
+        self._glitch_frames = {}   # consecutive rejected-as-glitch frames, per side
+        self._target_pos_prev = {} # last commanded IK target, for the rate limit
+        self._diverge_frames = {}  # consecutive frames with a large post-solve residual
+        self._diverge_warned = {}  # one-shot flag for the "holding position" message
         self.calibrated = False
+        self.calib_warning = None   # set by calibrate() if the captured pose looks lopsided
         self.last_grip = {"left": 0.0, "right": 0.0}
 
+    def try_calibrate(self, m, d, tele_data):
+        """Gated calibration. Returns True only on the frame the reference is
+        actually captured; until then returns False and the caller should
+        keep the arms held where they are.
+
+        Requires CALIB_SETTLE_TIME of consecutive frames that are ALL:
+        motion_data_ready, a finite non-identity/non-zero 4x4 wrist pose for
+        both hands, and within CALIB_STABILITY_TOL of the previous frame (the
+        operator holding still). This is what stops calibrate() from firing
+        on a stale first frame -- see the module-level calibration-gating
+        comment for why that produces the intermittent 'arm won't follow'
+        bug."""
+        if self.calibrated:
+            return False
+
+        if not getattr(tele_data, "motion_data_ready", False):
+            self._calib_reset("motion_data_ready is False")
+            return False
+
+        vr_pos = {}
+        for side, _, _, _ in _SIDES:
+            pose = np.asarray(getattr(tele_data, f"{side}_wrist_pose"), dtype=float)
+            if pose.shape != (4, 4) or not np.all(np.isfinite(pose)):
+                self._calib_reset(f"{side}_wrist_pose is not a finite 4x4")
+                return False
+            if np.linalg.norm(pose[:3, 3]) < 1e-6 or np.allclose(pose, np.eye(4), atol=1e-6):
+                self._calib_reset(f"{side}_wrist_pose still identity/zero (tracking not locked)")
+                return False
+            vr_pos[side] = pose[:3, 3].copy()
+
+        if self._calib_prev_vr_pos:
+            jump = max(np.linalg.norm(vr_pos[s] - self._calib_prev_vr_pos[s]) for s in vr_pos)
+            if jump > CALIB_STABILITY_TOL:
+                if self._debug and self._calib_streak:
+                    print(f"[calib] controllers still moving ({jump*100:.1f} cm/frame) -- streak reset")
+                self._calib_streak = 0
+                self._calib_prev_vr_pos = vr_pos
+                return False
+            self._calib_streak += 1
+        else:
+            self._calib_streak = 1
+        self._calib_prev_vr_pos = vr_pos
+
+        if self._calib_streak < self._calib_need:
+            return False
+        self.calibrate(m, d, tele_data)
+        return True
+
+    def _calib_reset(self, why):
+        if self._debug and self._calib_streak:
+            print(f"[calib] {why} -- streak reset")
+        self._calib_streak = 0
+        self._calib_prev_vr_pos = {}
+
+    def request_recalibration(self):
+        """Drop the current calibration; the next settled frames re-capture a
+        fresh reference via try_calibrate(). Lets the operator re-center live
+        -- after a bad capture, or after drifting to the edge of a
+        comfortable arm range -- without restarting."""
+        self.calibrated = False
+        self._calib_streak = 0
+        self._calib_prev_vr_pos = {}
+
     def calibrate(self, m, d, tele_data):
-        """Call once, as soon as tele_data.motion_data_ready is True (the
-        first real frame -- calibrating against stale/default data before
-        that would capture a meaningless reference). Pairs the operator's
-        CURRENT controller pose with the robot's CURRENT gripper-site pose
-        as the reference for the delta mapping described in the module
-        docstring. Re-callable if the operator wants to re-center (e.g.
-        after reaching the edge of a comfortable arm range)."""
+        """Capture the reference: the operator's CURRENT controller pose paired
+        with TELEOP_HOME (a mid-workspace robot pose, NOT the current stance
+        gripper pose -- see the TELEOP_HOME comment). The arm then ramps from
+        wherever it is to HOME via the step() rate limiter. Prefer
+        try_calibrate() -- calling this directly skips the stale-frame gate.
+        Re-callable to re-center."""
         for side, _, _, _ in _SIDES:
             ik = self._iks[side]
             ik.sync(d.qpos)
-            self._robot_ref_pos[side] = ik.site_pos()
-            self._robot_ref_quat[side] = _site_quat(ik)
+            here = ik.site_pos()                       # the arm's ACTUAL pose now
+            self._robot_ref_pos[side] = np.array(TELEOP_HOME[side], dtype=float)
+            # orientation reference = the orientation the arm SETTLES at at HOME
+            # (measured constant -- see TELEOP_HOME_QUAT), not the current stance
+            # orientation and not a bare IK solve (both differ, and the mismatch
+            # makes the 6-DOF solve fight position vs. a wrong orientation).
+            self._robot_ref_quat[side] = np.array(TELEOP_HOME_QUAT[side], dtype=float)
+            self._shoulder_pos[side] = d.xpos[self._shoulder_bid[side]].copy()
             vr_pos, vr_quat = _se3_to_pos_quat(getattr(tele_data, f"{side}_wrist_pose"))
             self._vr_ref_pos[side] = vr_pos
             self._vr_ref_quat[side] = vr_quat
-        self.calibrated = True
+            # seed the input filter at the reference so the first steps are no-ops
+            self._vr_pos_prev[side] = vr_pos.copy()
+            self._vr_pos_filt[side] = vr_pos.copy()
+            self._vr_quat_filt[side] = vr_quat.copy()
+            self._glitch_frames[side] = 0
+            self._target_pos_prev[side] = here.copy()  # rate-limit ramps here -> HOME
+            self._diverge_frames[side] = 0
+            self._diverge_warned[side] = False
+            if self._debug:
+                print(f"[calib] {side}: vr_ref_pos={np.array2string(vr_pos, precision=3)}  "
+                      f"HOME={np.array2string(self._robot_ref_pos[side], precision=3)}  "
+                      f"(arm at {np.array2string(here, precision=3)}, will ramp to HOME)")
 
-    def step(self, m, d, hold_ctrl, tele_data, scale=SCALE):
+        # A neutral two-handed calibration pose has the controllers at similar x/z
+        # and separated mostly in y. If they were far apart or lopsided, the
+        # operator wasn't holding a relaxed symmetric pose -- and then a NORMAL
+        # hand position maps, via the delta, to a cramped/unreachable arm target
+        # and the arm looks frozen (this is exactly what calibration_data_2.txt
+        # shows for the left arm: left controller was 50cm more forward + 56cm
+        # more left than the right at calibration).
+        lref, rref = self._vr_ref_pos["left"], self._vr_ref_pos["right"]
+        dx, dz = abs(lref[0] - rref[0]), abs(lref[2] - rref[2])
+        sep = float(np.linalg.norm(lref - rref))
+        self.calib_warning = None
+        if dx > 0.30 or dz > 0.30 or sep > 0.70:
+            self.calib_warning = (f"controllers asymmetric at calibration "
+                                  f"(dx={dx*100:.0f}cm dz={dz*100:.0f}cm sep={sep*100:.0f}cm)")
+            print(f"[calib] WARNING: {self.calib_warning} -- you likely weren't holding a "
+                  f"relaxed, symmetric pose (elbows ~90 deg, hands in front of your chest, "
+                  f"~30cm apart). Normal hand positions will map to unreachable arm targets. "
+                  f"Press 'c' to re-calibrate.")
+
+        self.calibrated = True
+        self._calib_streak = 0
+        self._calib_prev_vr_pos = {}
+
+    def _filter_vr(self, side, pos_raw, quat_raw):
+        """Reject single-frame tracking glitches (a Quest controller that
+        leaves the headset cameras' view freezes at its last pose, then SNAPS
+        30-60cm when re-acquired), then EMA-smooth what's left. Returns
+        (pos, quat, dropped) -- `dropped` True when this frame's raw pose was
+        rejected and the held value returned instead."""
+        jump = float(np.linalg.norm(pos_raw - self._vr_pos_prev[side]))
+        self._vr_pos_prev[side] = pos_raw.copy()
+
+        if jump > VR_GLITCH_TOL:
+            self._glitch_frames[side] += 1
+            if self._glitch_frames[side] * self._dt > VR_GLITCH_HOLD_TIME:
+                # persisted too long to be a glitch -- the operator really moved
+                # (or set a controller down and picked it up elsewhere); re-seat
+                self._vr_pos_filt[side] = pos_raw.copy()
+                self._vr_quat_filt[side] = quat_raw.copy()
+                self._glitch_frames[side] = 0
+                return self._vr_pos_filt[side].copy(), self._vr_quat_filt[side].copy(), False
+            return self._vr_pos_filt[side].copy(), self._vr_quat_filt[side].copy(), True
+
+        self._glitch_frames[side] = 0
+        a = VR_FILTER_ALPHA
+        self._vr_pos_filt[side] = (1.0 - a) * self._vr_pos_filt[side] + a * pos_raw
+        qf = self._vr_quat_filt[side]
+        if float(np.dot(qf, quat_raw)) < 0.0:   # keep both quats in the same hemisphere
+            quat_raw = -quat_raw
+        qf = (1.0 - a) * qf + a * quat_raw
+        n = float(np.linalg.norm(qf))
+        if n > 1e-9:
+            self._vr_quat_filt[side] = qf / n
+        return self._vr_pos_filt[side].copy(), self._vr_quat_filt[side].copy(), False
+
+    def step(self, m, d, hold_ctrl, tele_data, scale=None):
         """Advance one control step for both arms. Must not be called before
-        calibrate()."""
+        calibrate(). scale defaults to the instance's (see __init__)."""
         assert self.calibrated, "TeleopController.step() called before calibrate()"
+        if scale is None:
+            scale = self._scale
         d.ctrl[:] = hold_ctrl
+        self._step_i += 1
+        verbose = self._debug and (self._step_i % self._steps_per_sec == 0)
+        max_target_step = TARGET_MAX_SPEED * self._dt
         for side, _, arm_slice, _ in _SIDES:
             ik = self._iks[side]
             ik.sync(d.qpos)  # re-seed from the live sim every frame -- the arm
                               # actually moves under real physics between calls,
                               # unlike a scripted sequence's own warm-started scratch
 
-            vr_pos, vr_quat = _se3_to_pos_quat(getattr(tele_data, f"{side}_wrist_pose"))
+            vr_pos_raw, vr_quat_raw = _se3_to_pos_quat(getattr(tele_data, f"{side}_wrist_pose"))
+            vr_pos, vr_quat, dropped = self._filter_vr(side, vr_pos_raw, vr_quat_raw)
+
             pos_delta = scale * (vr_pos - self._vr_ref_pos[side])
-            target_pos = self._robot_ref_pos[side] + pos_delta
+            delta_norm = float(np.linalg.norm(pos_delta))
+            clamped = delta_norm > MAX_TARGET_DELTA
+            if clamped:
+                pos_delta = pos_delta * (MAX_TARGET_DELTA / delta_norm)
+            raw_target = self._robot_ref_pos[side] + pos_delta
 
-            quat_delta = _relative_quat(self._vr_ref_quat[side], vr_quat)
-            target_quat = _apply_relative_quat(quat_delta, self._robot_ref_quat[side])
+            # workspace clamp: pull the target onto the REACH_RADIUS sphere around
+            # the shoulder, so a big controller excursion pins at the nearest
+            # REACHABLE point instead of diverging (the table/brick targets sit
+            # ~0.40m from the shoulder, inside; a raised-arm lunge sits outside)
+            reach_vec = raw_target - self._shoulder_pos[side]
+            reach = float(np.linalg.norm(reach_vec))
+            reached_limit = reach > REACH_RADIUS
+            if reached_limit:
+                raw_target = self._shoulder_pos[side] + reach_vec * (REACH_RADIUS / reach)
 
-            q = ik.solve(target_pos, target_quat=target_quat, iters=4)
-            d.ctrl[arm_slice] = q
+            # rate-limit how fast the IK target may translate: a burst of accepted
+            # motion, or a post-dropout filter re-seat, then ramps in over
+            # ~0.1-0.2s instead of hitting the kp=500 position actuators as a step
+            # (unfiltered snaps destabilised the arm -- ik_resid ran to 700mm)
+            step_vec = raw_target - self._target_pos_prev[side]
+            step_len = float(np.linalg.norm(step_vec))
+            if step_len > max_target_step:
+                target_pos = self._target_pos_prev[side] + step_vec * (max_target_step / step_len)
+            else:
+                target_pos = raw_target
+            self._target_pos_prev[side] = target_pos
+
+            if self._track_orientation:
+                # apply the controller's rotation-since-calibration onto the arm's
+                # natural HOME orientation
+                quat_delta = _relative_quat(self._vr_ref_quat[side], vr_quat)
+                target_quat = _apply_relative_quat(quat_delta, self._robot_ref_quat[side])
+                q = ik.solve(target_pos, target_quat=target_quat, iters=IK_ITERS,
+                             ori_weight=TELEOP_ORI_WEIGHT)
+            else:
+                target_quat = None  # position-only IK -- see __init__ docstring
+                q = ik.solve(target_pos, iters=IK_ITERS)
+            resid = float(np.linalg.norm(ik.site_pos() - target_pos))
+
+            if resid > DIVERGENCE_RESID:
+                self._diverge_frames[side] += 1
+            else:
+                self._diverge_frames[side] = 0
+                self._diverge_warned[side] = False
+            diverged = self._diverge_frames[side] > self._diverge_need
+            if diverged:
+                # arm can't reach the target and isn't recovering -- hold it
+                # where it is rather than let it flail; resumes on its own once
+                # resid drops back under DIVERGENCE_RESID
+                d.ctrl[arm_slice] = d.qpos[arm_slice]
+                if not self._diverge_warned[side]:
+                    self._diverge_warned[side] = True
+                    print(f"[teleop] {side} arm not converging (site {resid*100:.0f}cm off "
+                          f"target) -- holding position until the input settles; press 'c' "
+                          f"to re-calibrate if it stays stuck")
+            else:
+                d.ctrl[arm_slice] = q
+
+            if self._step_i % self._steps_per_sec == 0:  # ~1/s, on regardless of debug
+                if clamped:
+                    print(f"[teleop] {side} IK target {delta_norm*100:.0f}cm past the "
+                          f"calibration reference, clamped -- reference is likely bad "
+                          f"(press 'c' to re-calibrate)")
+                elif reached_limit:
+                    print(f"[teleop] {side} controller reaching past the arm's "
+                          f"{REACH_RADIUS*100:.0f}cm envelope -- target pinned at the edge; "
+                          f"move back toward centre, or the table is just out of reach here")
+            if verbose:
+                ori_str = ""
+                if self._track_orientation:
+                    cur_q = np.zeros(4)
+                    mujoco.mju_mat2Quat(cur_q, ik.scratch.site_xmat[ik.site_id])
+                    oe = np.zeros(3)
+                    mujoco.mju_subQuat(oe, np.asarray(target_quat), cur_q)
+                    ori_str = f" ori_err={np.degrees(np.linalg.norm(oe)):4.1f}deg"
+                print(f"[teleop {self._step_i:6d}] {side}: "
+                      f"vr_pos={np.array2string(vr_pos, precision=3)} "
+                      f"|delta|={delta_norm*100:5.1f}cm "
+                      f"target={np.array2string(target_pos, precision=3)} "
+                      f"ik_resid={resid*1000:5.1f}mm{ori_str}"
+                      f"{'  DROPOUT' if dropped else ''}"
+                      f"{'  REACH' if reached_limit else ''}"
+                      f"{'  DIVERGED' if diverged else ''}")
 
             if self._hand_retargeter is not None:
                 # real per-finger control -- bypasses hand_ctrl()'s 3-pose

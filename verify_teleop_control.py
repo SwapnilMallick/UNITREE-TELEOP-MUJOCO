@@ -11,11 +11,16 @@ separate, on-hardware check (see teleop_control.py's module docstring,
 
 FakeTeleopSource fabricates TeleData-shaped frames: motion_data_ready is
 False for the first few calls (mimicking real startup, where the headset
-connection isn't live instantly), then True. Once "live", the right
-controller's wrist_pose ramps a straight-line +5cm move in x over
-RAMP_TIME seconds (left stays put, isolating the test to one arm) and its
-trigger value ramps released(10.0) -> fully pressed(0.0) -> released again,
-so both the position-delta and grip mapping get exercised.
+connection isn't live instantly), then True but with the wrist poses still
+at identity for a few more frames (mimicking "connection up, controller
+tracking not locked on yet" -- the exact stale-frame window that used to
+poison calibration). Once genuinely live, the controllers sit at a
+realistic non-identity resting pose and the right one's wrist_pose ramps a
+straight-line +5cm move in x over RAMP_TIME seconds (left stays put,
+isolating the test to one arm); its trigger value ramps released(10.0) ->
+fully pressed(0.0) -> released again, so both the position-delta and grip
+mapping get exercised. The test asserts calibration does NOT fire during
+the stale window.
 
 Run: python verify_teleop_control.py
 """
@@ -32,7 +37,8 @@ MODEL_DIR = pathlib.Path(os.environ.get(
 SCENE = MODEL_DIR / "scene_fixed_table.xml"
 
 READY_AFTER_FRAMES = 5     # startup delay before motion_data_ready goes True
-RAMP_TIME = 2.0            # s, right wrist's synthetic +5cm move in x
+POSE_STALE_FRAMES = 3      # extra frames where it's "ready" but poses are still identity
+RAMP_TIME = 2.0           # s, right wrist's synthetic +5cm move in x
 MOVE_DISTANCE = 0.05       # m
 TRIGGER_RAMP_TIME = 1.0    # s, released -> fully pressed
 ROTATE_RAMP_TIME = 2.0     # s, small synthetic rotation on the right wrist,
@@ -50,22 +56,33 @@ class FakeTeleData:
 
 
 class FakeTeleopSource:
+    # realistic resting controller poses -- a real headset never reports a
+    # controller exactly at the tracking origin with identity rotation, and the
+    # calibration gate now rejects identity poses as "tracking not locked yet"
+    RIGHT_BASE = np.array([0.35, -0.25, 1.05])
+    LEFT_BASE = np.array([0.35, 0.25, 1.05])
+    POSE_LOCKED_FRAME = READY_AFTER_FRAMES + POSE_STALE_FRAMES
+
     def __init__(self, dt):
         self.dt = dt
-        self._t = 0.0
         self._frame = 0
 
     def get_tele_data(self):
-        ready = self._frame >= READY_AFTER_FRAMES
+        f = self._frame
         self._frame += 1
-        t_live = max(self._t - READY_AFTER_FRAMES * self.dt, 0.0) if ready else 0.0
-        self._t += self.dt
+        ready = f >= READY_AFTER_FRAMES
+        if f < self.POSE_LOCKED_FRAME:
+            # connection down, or up but controller pose still stale (identity)
+            return FakeTeleData(np.eye(4), np.eye(4), 10.0, 10.0, ready)
 
-        left_pose = np.eye(4)  # left stays put for the whole run
+        t_live = (f - self.POSE_LOCKED_FRAME) * self.dt
+
+        left_pose = np.eye(4)
+        left_pose[:3, 3] = self.LEFT_BASE  # left stays put for the whole run
 
         right_pose = np.eye(4)
         move_alpha = min(t_live / RAMP_TIME, 1.0)
-        right_pose[0, 3] = move_alpha * MOVE_DISTANCE  # +x translation
+        right_pose[:3, 3] = self.RIGHT_BASE + np.array([move_alpha * MOVE_DISTANCE, 0.0, 0.0])
 
         rot_alpha = min(t_live / ROTATE_RAMP_TIME, 1.0)
         angle = rot_alpha * 0.2  # small rotation about z, radians
@@ -82,7 +99,7 @@ class FakeTeleopSource:
         else:
             right_trigger = 10.0
 
-        return FakeTeleData(left_pose, right_pose, 10.0, right_trigger, ready)
+        return FakeTeleData(left_pose, right_pose, 10.0, right_trigger, True)
 
 
 def main():
@@ -96,7 +113,9 @@ def main():
 
     dt = m.opt.timestep
     source = FakeTeleopSource(dt)
-    ctrl = TeleopController(m)
+    ctrl = TeleopController(m, scale=1.0)  # unity here -- this test checks the
+                                           # delta MAPPING; --teleop-scale is
+                                           # exercised in scale_compresses_motion()
 
     right_site_start = None
     calibrated_at_step = None
@@ -108,8 +127,7 @@ def main():
         data = source.get_tele_data()
         if not ctrl.calibrated:
             assert not np.any(np.isnan(d.qpos)), "NaN before calibration even happened"
-            if data.motion_data_ready:
-                ctrl.calibrate(m, d, data)
+            if ctrl.try_calibrate(m, d, data):
                 calibrated_at_step = i
                 right_site_start = ctrl._iks["right"].site_pos().copy()
                 print(f"calibrated at step {i} (t={i*dt:.2f}s)")
@@ -126,7 +144,14 @@ def main():
         assert not np.any(np.isnan(d.qpos)) and not np.any(np.isnan(d.qvel)), \
             f"NaN at step {i}"
 
-    assert calibrated_at_step is not None, "never calibrated -- motion_data_ready logic broken"
+    assert calibrated_at_step is not None, "never calibrated -- gating too strict or logic broken"
+    # the gate must NOT capture during the stale window (ready, but poses still
+    # identity) -- that's the whole point of try_calibrate
+    assert calibrated_at_step >= source.POSE_LOCKED_FRAME, (
+        f"calibrated at step {calibrated_at_step}, before poses locked at "
+        f"{source.POSE_LOCKED_FRAME} -- gate let a stale/identity pose through")
+    print(f"gate held off calibration through the stale window "
+          f"(poses locked at frame {source.POSE_LOCKED_FRAME})")
 
     right_site_end = ctrl._iks["right"].site_pos()
     tracked_delta = right_site_end - right_site_start
@@ -149,6 +174,331 @@ def main():
     print("It does NOT verify the coordinate mapping against a real headset --")
     print("see teleop_control.py's 'First real-hardware checks' before trusting it live.")
     assert ok
+
+    calibration_gate_and_clamp()
+
+
+def calibration_gate_and_clamp():
+    """Focused checks on the calibration-race fix: the gate rejects not-ready
+    and identity poses, request_recalibration() drops the reference, and an
+    out-of-reach IK target (a bad reference would produce these every frame)
+    is clamped instead of parking the arm at a limit."""
+    from teleop_control import MAX_TARGET_DELTA
+
+    m = mujoco.MjModel.from_xml_path(str(SCENE))
+    d = mujoco.MjData(m)
+    key_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_KEY, "stand_at_table")
+    mujoco.mj_resetDataKeyframe(m, d, key_id)
+    hold = m.key_ctrl[key_id].copy()
+    d.ctrl[:] = hold
+    mujoco.mj_forward(m, d)
+
+    ctrl = TeleopController(m)
+    I = np.eye(4)
+    good = np.eye(4); good[:3, 3] = [0.35, -0.25, 1.05]
+
+    # not ready -> never calibrates, however many frames
+    for _ in range(50):
+        assert not ctrl.try_calibrate(m, d, FakeTeleData(good, good, 10.0, 10.0, False))
+    assert not ctrl.calibrated
+    # ready but identity poses -> still never calibrates
+    for _ in range(50):
+        assert not ctrl.try_calibrate(m, d, FakeTeleData(I, I, 10.0, 10.0, True))
+    assert not ctrl.calibrated
+    # ready + valid + held still -> calibrates within ~CALIB_SETTLE_TIME
+    frames = 0
+    while not ctrl.try_calibrate(m, d, FakeTeleData(good, good, 10.0, 10.0, True)):
+        frames += 1
+        assert frames < 10 * ctrl._calib_need, "stable valid pose never calibrated"
+    assert ctrl.calibrated
+    print(f"gate: rejected not-ready + identity, calibrated after {frames} stable frames")
+
+    # a wildly-out-of-reach controller (a bad reference produces these every
+    # frame) -- held for a while so the rate-limited target fully ramps out;
+    # the MAX_TARGET_DELTA clamp must still bound where it settles
+    far = np.eye(4); far[:3, 3] = good[:3, 3] + np.array([5.0, 0.0, 0.0])  # 5 m away
+    for _ in range(int(2.0 / m.opt.timestep)):
+        ctrl.step(m, d, hold, FakeTeleData(far, far, 10.0, 10.0, True))
+        mujoco.mj_step(m, d)
+    for side in ("left", "right"):
+        reached = np.linalg.norm(ctrl._target_pos_prev[side] - ctrl._robot_ref_pos[side])
+        assert reached < MAX_TARGET_DELTA + 1e-6, (
+            f"{side} IK target {reached:.2f} m from ref -- clamp didn't hold it in")
+    assert not np.any(np.isnan(d.qpos)), "NaN after a clamped out-of-reach target"
+    print(f"clamp: sustained 5 m controller offset held the IK target within "
+          f"{MAX_TARGET_DELTA} m of the reference, no NaN")
+
+    # request_recalibration drops the reference and re-gates
+    ctrl.request_recalibration()
+    assert not ctrl.calibrated
+    assert not ctrl.try_calibrate(m, d, FakeTeleData(I, I, 10.0, 10.0, True)), \
+        "re-calibration skipped the gate"
+    print("request_recalibration: dropped calibration and re-gated")
+    print("\ncalibration gate + clamp: PASS")
+
+    jumpy_input_stays_stable()
+
+
+def jumpy_input_stays_stable():
+    """The real-hardware failure: Quest controller poses freeze then SNAP
+    30-60cm on reacquire, and unfiltered that ran the arm's IK residual to
+    ~700mm (permanent flailing). With _filter_vr + the target rate-limit the
+    snaps are rejected, the arm stays near stance through the storm, and it
+    tracks again once the input goes clean."""
+    m = mujoco.MjModel.from_xml_path(str(SCENE))
+    d = mujoco.MjData(m)
+    key_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_KEY, "stand_at_table")
+    mujoco.mj_resetDataKeyframe(m, d, key_id)
+    hold = m.key_ctrl[key_id].copy()
+    d.ctrl[:] = hold
+    mujoco.mj_forward(m, d)
+    dt = m.opt.timestep
+    rsite = m.site("right_gripper_site").id
+
+    ctrl = TeleopController(m, scale=1.0)  # unity -- isolate recovery from scaling
+    base_l = np.array([0.35, 0.25, 1.05])
+    base_r = np.array([0.35, -0.25, 1.05])
+
+    def pose(p):
+        T = np.eye(4); T[:3, 3] = p
+        return T
+
+    steady = FakeTeleData(pose(base_l), pose(base_r), 10.0, 10.0, True)
+    for _ in range(5 * ctrl._calib_need):
+        if ctrl.try_calibrate(m, d, steady):
+            break
+    assert ctrl.calibrated, "calibration never completed on a steady pose"
+    # let the arm ramp from stance to TELEOP_HOME under neutral input, THEN
+    # measure -- the reference for "did it stay put" is HOME, not stance
+    for _ in range(int(2.5 / dt)):
+        ctrl.step(m, d, hold, steady)
+        mujoco.mj_step(m, d)
+    ref = d.site_xpos[rsite].copy()
+
+    # regime 1: ~3s of freeze/snap alternation, each state well under the
+    # re-seat hold time, so every snap is rejected and the arm should barely move
+    rng = np.random.default_rng(0)
+    max_excursion = 0.0
+    for i in range(int(3.0 / dt)):
+        r = base_r if (i // 40) % 2 == 0 else base_r + rng.uniform(-0.3, 0.3, 3)
+        ctrl.step(m, d, hold, FakeTeleData(pose(base_l), pose(r), 10.0, 10.0, True))
+        mujoco.mj_step(m, d)
+        assert not np.any(np.isnan(d.qpos)) and not np.any(np.isnan(d.qvel)), f"NaN at step {i}"
+        assert np.allclose(d.ctrl[LEG], hold[LEG]) and np.allclose(d.ctrl[WAIST], hold[WAIST]), \
+            f"LEG/WAIST ctrl drifted at step {i}"
+        max_excursion = max(max_excursion, float(np.linalg.norm(d.site_xpos[rsite] - ref)))
+    print(f"jumpy input: right arm stayed within {max_excursion*100:.1f}cm of HOME "
+          f"through 3s of freeze/snap (unfiltered this ran to ~70cm)")
+    assert max_excursion < 0.12, "glitch rejection didn't hold the arm near HOME"
+
+    # regime 2: input goes clean and ramps +12cm in x -- arm should recover and track it
+    for i in range(int(3.0 / dt)):
+        a = min(i * dt / 1.5, 1.0)
+        r = base_r + np.array([0.12 * a, 0.0, 0.0])
+        ctrl.step(m, d, hold, FakeTeleData(pose(base_l), pose(r), 10.0, 10.0, True))
+        mujoco.mj_step(m, d)
+    moved = d.site_xpos[rsite] - ref
+    print(f"after the storm + a clean +12cm x ramp, right site moved {moved} m")
+    assert not np.any(np.isnan(d.qpos))
+    assert moved[0] > 0.05 and abs(moved[0]) > 2.0 * (abs(moved[1]) + abs(moved[2])), \
+        "arm didn't recover clean tracking after the dropout storm"
+    print("\njumpy input stability: PASS")
+
+    scale_compresses_motion()
+
+
+def scale_compresses_motion():
+    """--teleop-scale: a controller move should map to `scale` x that move on
+    the robot, so the operator's (larger) arm range fits the arm's envelope."""
+    m = mujoco.MjModel.from_xml_path(str(SCENE))
+    d = mujoco.MjData(m)
+    key_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_KEY, "stand_at_table")
+    mujoco.mj_resetDataKeyframe(m, d, key_id)
+    hold = m.key_ctrl[key_id].copy()
+    d.ctrl[:] = hold
+    mujoco.mj_forward(m, d)
+    dt = m.opt.timestep
+    rsite = m.site("right_gripper_site").id
+    base_l = np.array([0.35, 0.25, 1.05])
+    base_r = np.array([0.35, -0.25, 1.05])
+
+    def pose(p):
+        T = np.eye(4); T[:3, 3] = p
+        return T
+
+    moved_at = {}
+    for s in (1.0, 0.5):
+        mujoco.mj_resetDataKeyframe(m, d, key_id)
+        d.ctrl[:] = hold
+        mujoco.mj_forward(m, d)
+        ctrl = TeleopController(m, scale=s)
+        for _ in range(5 * ctrl._calib_need):
+            if ctrl.try_calibrate(m, d, FakeTeleData(pose(base_l), pose(base_r), 10.0, 10.0, True)):
+                break
+        assert ctrl.calibrated
+        steady = FakeTeleData(pose(base_l), pose(base_r), 10.0, 10.0, True)
+        for _ in range(int(2.5 / dt)):        # settle at HOME first
+            ctrl.step(m, d, hold, steady)
+            mujoco.mj_step(m, d)
+        ref = d.site_xpos[rsite].copy()
+        for i in range(int(3.0 / dt)):
+            a = min(i * dt / 1.5, 1.0)
+            r = base_r + np.array([0.0, 0.0, 0.10 * a])   # +10cm controller move in z
+            ctrl.step(m, d, hold, FakeTeleData(pose(base_l), pose(r), 10.0, 10.0, True))
+            mujoco.mj_step(m, d)
+        moved_at[s] = float(d.site_xpos[rsite][2] - ref[2])
+    print(f"+10cm controller move -> robot site rose {moved_at[1.0]*100:.1f}cm at scale 1.0, "
+          f"{moved_at[0.5]*100:.1f}cm at scale 0.5")
+    assert moved_at[1.0] > 0.06, "scale 1.0 didn't track the 10cm move"
+    assert 0.35 < moved_at[0.5] / moved_at[1.0] < 0.65, \
+        f"scale 0.5 should roughly halve the motion, got ratio {moved_at[0.5]/moved_at[1.0]:.2f}"
+    print("\nscale compresses motion: PASS")
+
+    lopsided_calibration_warns()
+
+
+def lopsided_calibration_warns():
+    """A contorted (asymmetric) calibration pose maps normal hand positions to
+    unreachable arm targets -- calibrate() should flag it (calibration_data_2.txt)."""
+    m = mujoco.MjModel.from_xml_path(str(SCENE))
+    d = mujoco.MjData(m)
+    key_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_KEY, "stand_at_table")
+    mujoco.mj_resetDataKeyframe(m, d, key_id)
+    hold = m.key_ctrl[key_id].copy()
+    d.ctrl[:] = hold
+    mujoco.mj_forward(m, d)
+
+    def pose(p):
+        T = np.eye(4); T[:3, 3] = np.asarray(p, float)
+        return T
+
+    # neutral, symmetric -> no warning
+    ctrl = TeleopController(m)
+    for _ in range(5 * ctrl._calib_need):
+        if ctrl.try_calibrate(m, d, FakeTeleData(pose([0.35, 0.25, 1.05]),
+                                                 pose([0.35, -0.25, 1.05]), 10.0, 10.0, True)):
+            break
+    assert ctrl.calibrated and ctrl.calib_warning is None, \
+        f"symmetric calibration should not warn (got {ctrl.calib_warning!r})"
+
+    # the calibration_data_2.txt geometry: left 50cm more forward + 56cm more left
+    ctrl2 = TeleopController(m)
+    for _ in range(5 * ctrl2._calib_need):
+        if ctrl2.try_calibrate(m, d, FakeTeleData(pose([0.897, 0.388, 0.198]),
+                                                  pose([0.397, -0.170, 0.138]), 10.0, 10.0, True)):
+            break
+    assert ctrl2.calibrated and ctrl2.calib_warning is not None, \
+        "a lopsided calibration pose should set calib_warning"
+    print(f"lopsided calibration flagged: {ctrl2.calib_warning}")
+    print("\nlopsided calibration warning: PASS")
+
+    table_target_reachable()
+
+
+def table_target_reachable():
+    """From a neutral calibration, a controller move that maps to the brick1
+    grasp pose must actually get the arm there -- not be blocked by the
+    REACH_RADIUS / MAX_TARGET_DELTA clamps (calibration_data_3.txt: the user
+    couldn't place the arm over the table)."""
+    m = mujoco.MjModel.from_xml_path(str(SCENE))
+    d = mujoco.MjData(m)
+    key_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_KEY, "stand_at_table")
+    mujoco.mj_resetDataKeyframe(m, d, key_id)
+    hold = m.key_ctrl[key_id].copy()
+    d.ctrl[:] = hold
+    mujoco.mj_forward(m, d)
+    dt = m.opt.timestep
+    rsite = m.site("right_gripper_site").id
+    grasp_pos = d.xpos[m.body("brick1").id].copy() + np.array([0.0, 0.0, 0.04])  # GRASP_HEIGHT
+
+    def pose(p):
+        T = np.eye(4); T[:3, 3] = np.asarray(p, float)
+        return T
+
+    base_l, base_r = np.array([0.35, 0.25, 1.05]), np.array([0.35, -0.25, 1.05])
+    scale = 0.5
+    ctrl = TeleopController(m, scale=scale)
+    for _ in range(5 * ctrl._calib_need):
+        if ctrl.try_calibrate(m, d, FakeTeleData(pose(base_l), pose(base_r), 10.0, 10.0, True)):
+            break
+    assert ctrl.calibrated and ctrl.calib_warning is None
+    steady = FakeTeleData(pose(base_l), pose(base_r), 10.0, 10.0, True)
+    for _ in range(int(3.0 / dt)):        # ramp stance -> HOME
+        ctrl.step(m, d, hold, steady)
+        mujoco.mj_step(m, d)
+
+    # controller pose that maps (via the delta, at this scale) to grasp_pos
+    vr_target = ctrl._vr_ref_pos["right"] + (grasp_pos - ctrl._robot_ref_pos["right"]) / scale
+    for i in range(int(7.0 / dt)):
+        a = min(i * dt / 2.0, 1.0)                    # 2s ramp, then 5s hold to settle
+        r = base_r + a * (vr_target - base_r)
+        ctrl.step(m, d, hold, FakeTeleData(pose(base_l), pose(r), 10.0, 10.0, True))
+        mujoco.mj_step(m, d)
+
+    err = float(np.linalg.norm(d.site_xpos[rsite] - grasp_pos))
+    print(f"teleop-commanded from HOME to the brick1 grasp pose {np.round(grasp_pos,3)}: "
+          f"right gripper site landed {err*100:.1f}cm away")
+    assert not np.any(np.isnan(d.qpos))
+    assert err < 0.05, ("brick grasp pose not reachable via teleop -- a clamp is too "
+                        "tight, or the arm_ik posture-bias parks it too far short")
+    print("\ntable target reachable: PASS")
+
+    orientation_mode_rotates_gripper()
+
+
+def orientation_mode_rotates_gripper():
+    """--teleop-orientation (EXPERIMENTAL): rotating the controller does rotate
+    the gripper and doesn't NaN. It does NOT assert faithful tracking or tight
+    position -- arm_ik's 6-DOF solve is erratic here (a 60deg command gives
+    ~25-140deg depending on axis, position degrades 10-25cm); this just guards
+    that the mode is wired and not catastrophically broken. Real
+    grasp-alignment orientation needs a weighted IK replacing arm_ik."""
+    m = mujoco.MjModel.from_xml_path(str(SCENE))
+    d = mujoco.MjData(m)
+    key_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_KEY, "stand_at_table")
+    mujoco.mj_resetDataKeyframe(m, d, key_id)
+    hold = m.key_ctrl[key_id].copy()
+    d.ctrl[:] = hold
+    mujoco.mj_forward(m, d)
+    dt = m.opt.timestep
+    rsite = m.site("right_gripper_site").id
+    base_l, base_r = np.array([0.35, 0.25, 1.05]), np.array([0.35, -0.25, 1.05])
+
+    def roty(a):
+        c, s = np.cos(a), np.sin(a)
+        return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+
+    def pose(p, R=np.eye(3)):
+        T = np.eye(4); T[:3, :3] = R; T[:3, 3] = np.asarray(p, float)
+        return T
+
+    ctrl = TeleopController(m, scale=0.5, track_orientation=True)
+    for _ in range(5 * ctrl._calib_need):
+        if ctrl.try_calibrate(m, d, FakeTeleData(pose(base_l), pose(base_r), 10.0, 10.0, True)):
+            break
+    assert ctrl.calibrated
+    steady = FakeTeleData(pose(base_l), pose(base_r), 10.0, 10.0, True)
+    for _ in range(int(3.0 / dt)):                       # settle at HOME
+        ctrl.step(m, d, hold, steady)
+        mujoco.mj_step(m, d)
+    R_home = d.site_xmat[rsite].reshape(3, 3).copy()
+
+    theta = np.radians(40.0)                             # pitch the controller 40 deg about Y
+    for i in range(int(5.0 / dt)):
+        a = min(i * dt / 2.0, 1.0)
+        R = roty(a * theta)
+        ctrl.step(m, d, hold, FakeTeleData(pose(base_l), pose(base_r, R), 10.0, 10.0, True))
+        mujoco.mj_step(m, d)
+
+    R_now = d.site_xmat[rsite].reshape(3, 3)
+    R_rel = R_now @ R_home.T
+    ang = np.degrees(np.arccos(np.clip((np.trace(R_rel) - 1.0) / 2.0, -1.0, 1.0)))
+    pos_err = float(np.linalg.norm(d.site_xpos[rsite] - ctrl._robot_ref_pos["right"]))
+    print(f"controller pitched 40deg about Y -> gripper rotated {ang:.1f}deg; "
+          f"position {pos_err*100:.1f}cm from HOME (erratic by design -- see docstring)")
+    assert not np.any(np.isnan(d.qpos)) and not np.any(np.isnan(d.qvel))
+    assert ang > 10.0, "orientation mode wired but the gripper didn't rotate at all"
+    print("\norientation mode rotates gripper (experimental): PASS")
 
 
 if __name__ == "__main__":
