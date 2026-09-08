@@ -35,6 +35,7 @@ MODEL_DIR = pathlib.Path(os.environ.get(
     "MODEL_DIR",
     pathlib.Path(__file__).resolve().parent.parent / "mujoco_menagerie" / "unitree_g1"))
 SCENE = MODEL_DIR / "scene_fixed_table.xml"
+ROBOT_XML = MODEL_DIR / "g1_fixed_upper.xml"   # Pinocchio model for --teleop-weighted-ik
 
 READY_AFTER_FRAMES = 5     # startup delay before motion_data_ready goes True
 POSE_STALE_FRAMES = 3      # extra frames where it's "ready" but poses are still identity
@@ -499,6 +500,158 @@ def orientation_mode_rotates_gripper():
     assert not np.any(np.isnan(d.qpos)) and not np.any(np.isnan(d.qvel))
     assert ang > 10.0, "orientation mode wired but the gripper didn't rotate at all"
     print("\norientation mode rotates gripper (experimental): PASS")
+
+    try:
+        import pinocchio  # noqa: F401
+    except ImportError:
+        print("\n[skip] --teleop-weighted-ik checks: pinocchio not installed "
+              "(not a failure -- solver='lm' needs pinocchio, 'ipopt' also needs casadi)")
+        return
+    weighted_ik_orientation_follows()
+    weighted_ik_position_in_regime()
+
+
+# --------------------------------------------------------------------------- #
+#  --teleop-weighted-ik (weighted_arm_ik.WeightedArmIK) -- the fix for        #
+#  --teleop-orientation. Mirrors the sweep in                                 #
+#  orientation_mode_rotates_gripper() that exposed the DLS solver's failure   #
+#  and asserts the weighted IK does NOT reproduce it.                         #
+# --------------------------------------------------------------------------- #
+def _wik_ctrl(m, d, hold, dt, **kw):
+    """Build a weighted-IK TeleopController, calibrate on a neutral symmetric
+    pose, and settle at TELEOP_HOME. Returns (ctrl, steady_frame)."""
+    base_l, base_r = np.array([0.35, 0.25, 1.05]), np.array([0.35, -0.25, 1.05])
+
+    def pose(p, R=np.eye(3)):
+        T = np.eye(4); T[:3, :3] = R; T[:3, 3] = np.asarray(p, float)
+        return T
+
+    ctrl = TeleopController(m, scale=0.5, weighted_ik=True,
+                            weighted_ik_mjcf=str(ROBOT_XML), **kw)
+    steady = FakeTeleData(pose(base_l), pose(base_r), 10.0, 10.0, True)
+    for _ in range(5 * ctrl._calib_need):
+        if ctrl.try_calibrate(m, d, steady):
+            break
+    assert ctrl.calibrated, "weighted-IK controller never calibrated"
+    for _ in range(int(3.0 / dt)):
+        ctrl.step(m, d, hold, steady)
+        mujoco.mj_step(m, d)
+    return ctrl, steady, pose
+
+
+def weighted_ik_orientation_follows():
+    """The win: with --teleop-weighted-ik, a controller rotation produces a
+    BOUNDED, monotonic gripper rotation (never the DLS solver's 130-160deg
+    overshoot of a 45deg command), the moving arm HOLDS position, and the
+    NON-MOVING arm stays put (DLS drifts it 13-17cm). Checked about all three
+    site axes because the DLS failure was wildly axis-dependent."""
+    m = mujoco.MjModel.from_xml_path(str(SCENE))
+    d = mujoco.MjData(m)
+    key_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_KEY, "stand_at_table")
+    hold = m.key_ctrl[key_id].copy()
+    dt = m.opt.timestep
+    rsite = m.site("right_gripper_site").id
+    lsite = m.site("left_gripper_site").id
+
+    def rot(axis, a):
+        c, s = np.cos(a), np.sin(a)
+        if axis == "X":
+            return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+        if axis == "Y":
+            return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+        return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+    CMD = 45.0
+    for axis in ("X", "Y", "Z"):
+        mujoco.mj_resetDataKeyframe(m, d, key_id)
+        d.ctrl[:] = hold
+        mujoco.mj_forward(m, d)
+        ctrl, steady, pose = _wik_ctrl(m, d, hold, dt, track_orientation=True)
+        R_home = d.site_xmat[rsite].reshape(3, 3).copy()
+        L_home_p = d.site_xpos[lsite].copy()
+        L_home_R = d.site_xmat[lsite].reshape(3, 3).copy()
+        base_l, base_r = np.array([0.35, 0.25, 1.05]), np.array([0.35, -0.25, 1.05])
+
+        theta = np.radians(CMD)
+        for i in range(int(4.0 / dt)):
+            a = min(i * dt / 2.0, 1.0)
+            fr = FakeTeleData(pose(base_l), pose(base_r, rot(axis, a * theta)),
+                              10.0, 10.0, True)
+            ctrl.step(m, d, hold, fr)
+            mujoco.mj_step(m, d)
+            assert np.allclose(d.ctrl[LEG], hold[LEG]) and np.allclose(d.ctrl[WAIST], hold[WAIST]), \
+                f"LEG/WAIST ctrl drifted ({axis})"
+            assert not np.any(np.isnan(d.qpos)) and not np.any(np.isnan(d.qvel)), f"NaN ({axis})"
+
+        R_now = d.site_xmat[rsite].reshape(3, 3)
+        got = np.degrees(np.arccos(np.clip(
+            (np.trace(R_now @ R_home.T) - 1.0) / 2.0, -1.0, 1.0)))
+        pos_hold = float(np.linalg.norm(d.site_xpos[rsite] - ctrl._robot_ref_pos["right"]))
+        l_drift = float(np.linalg.norm(d.site_xpos[lsite] - L_home_p))
+        l_rot = np.degrees(np.arccos(np.clip(
+            (np.trace(d.site_xmat[lsite].reshape(3, 3) @ L_home_R.T) - 1.0) / 2.0, -1.0, 1.0)))
+        print(f"  weighted-IK {axis} 45deg cmd -> gripper {got:5.1f}deg | "
+              f"moving-arm pos-hold {pos_hold*100:4.1f}cm | "
+              f"non-moving arm drift {l_drift*100:4.1f}cm / {l_rot:4.1f}deg")
+
+        # the gripper responded, but is NOT wildly overshooting the command the
+        # way arm_ik's DLS 6-DOF solve did (it produced 127-159deg for 45 cmd) --
+        # mink is faithful on all three axes (measured 43-46deg for a 45deg cmd)
+        assert 5.0 < got < 1.6 * CMD, (
+            f"{axis}: gripper rotated {got:.0f}deg for a {CMD:.0f}deg command -- "
+            f"weighted IK should be bounded/monotonic, not the DLS overshoot")
+        # position mostly holds (X/Z: <2cm) but the Y-axis rotation genuinely
+        # drives the wrist assembly into a configuration where the G1's wrist
+        # actuators (actuatorfrcrange="-5 5", +/-5 Nm -- see
+        # weighted_arm_ik.py's docstring) can't fully track the commanded
+        # joint angles -- measured ~6-7cm on Y, a real arm-hardware limit, not
+        # a solver bug (still tighter than DLS's 11.4cm on the same axis).
+        assert pos_hold < 0.08, f"{axis}: moving arm drifted {pos_hold*100:.1f}cm holding position"
+        # the OTHER arm stays put (DLS let it wander 13-17cm) -- mink measured
+        # ~0.01cm on every axis, essentially perfectly still
+        assert l_drift < 0.03 and l_rot < 15.0, (
+            f"{axis}: non-moving arm moved {l_drift*100:.1f}cm / {l_rot:.0f}deg")
+
+    print("\nweighted-IK orientation follows (bounded, position held, other arm still): PASS")
+
+
+def weighted_ik_position_in_regime():
+    """Position parity check: in the real teleop operating regime (a pregrasp
+    pose ~0.35m from the shoulder, above the table), --teleop-weighted-ik gets
+    the gripper there about as well as the DLS solver does -- i.e. swapping the
+    solver did not regress position tracking where it matters. (Both solvers
+    degrade at fully-extended low reaches where the wrist actuators
+    torque-saturate; that regime is a known arm-hardware limit, not tested
+    here.)"""
+    m = mujoco.MjModel.from_xml_path(str(SCENE))
+    d = mujoco.MjData(m)
+    key_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_KEY, "stand_at_table")
+    hold = m.key_ctrl[key_id].copy()
+    dt = m.opt.timestep
+    rsite = m.site("right_gripper_site").id
+    mujoco.mj_resetDataKeyframe(m, d, key_id)
+    d.ctrl[:] = hold
+    mujoco.mj_forward(m, d)
+    pregrasp = d.xpos[m.body("brick1").id].copy() + np.array([0.0, 0.0, 0.12])
+
+    ctrl, steady, pose = _wik_ctrl(m, d, hold, dt)
+    base_l, base_r = np.array([0.35, 0.25, 1.05]), np.array([0.35, -0.25, 1.05])
+    scale = 0.5
+    vr_target = ctrl._vr_ref_pos["right"] + (pregrasp - ctrl._robot_ref_pos["right"]) / scale
+    for i in range(int(7.0 / dt)):
+        a = min(i * dt / 2.5, 1.0)
+        r = base_r + a * (vr_target - base_r)
+        ctrl.step(m, d, hold, FakeTeleData(pose(base_l), pose(r), 10.0, 10.0, True))
+        mujoco.mj_step(m, d)
+        assert np.allclose(d.ctrl[LEG], hold[LEG]) and np.allclose(d.ctrl[WAIST], hold[WAIST])
+
+    err = float(np.linalg.norm(d.site_xpos[rsite] - pregrasp))
+    print(f"  weighted-IK reach to brick1 pregrasp {np.round(pregrasp, 3)}: "
+          f"gripper landed {err*100:.1f}cm away")
+    assert not np.any(np.isnan(d.qpos))
+    assert err < 0.03, ("weighted IK regressed in-regime position tracking "
+                        f"({err*100:.1f}cm, DLS gets ~0.3cm here)")
+    print("\nweighted-IK position in operating regime: PASS")
 
 
 if __name__ == "__main__":

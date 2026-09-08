@@ -15,9 +15,10 @@ tabletop — the setup step before teleoperated pick-and-place / stacking contro
 | [make_fixed_base.py](make_fixed_base.py) | Generates a fixed-base G1 MJCF from a stock Menagerie G1 (welds the pelvis, trims the keyframe, adds an FPV camera). |
 | [g1_fixed_upper.xml](g1_fixed_upper.xml) | Reference copy of the generated fixed-base G1 (currently: Dex3-1 3-finger hands). |
 | [scene_fixed_table.xml](scene_fixed_table.xml) | Full scene: robot + floor + table + three bricks, plus the `stand_at_table` reset keyframe. |
-| [stand_next_to_table.py](stand_next_to_table.py) | Launcher — opens the viewer next to the table. `--pick {brick1,brick2,brick3,none}` drives a live scripted pick-lift-hold sequence (default `brick1`); `--pick none` just holds stance; `--teleop` drives both arms live from a VR headset instead. |
+| [stand_next_to_table.py](stand_next_to_table.py) | Launcher — opens the viewer next to the table. `--pick {brick1,brick2,brick3,none}` drives a live scripted pick-lift-hold sequence (default `brick1`); `--pick none` just holds stance; `--teleop` drives both arms live from a VR headset instead (`--teleop-weighted-ik` + `--teleop-orientation` for faithful 6-DOF follow via the **mink** weighted IK, `--display-mode ego\|immersive` to stream the head camera to the headset, `--record-episodes DIR` + `s` in the viewer to record demos). See "Teleop loop" below. |
 | [actuator_groups.py](actuator_groups.py) | Shared `LEG`/`WAIST`/`LEFT_ARM`/`LEFT_HAND`/`RIGHT_ARM`/`RIGHT_HAND`/`UPPER_BODY` qpos/ctrl slice constants. |
-| [arm_ik.py](arm_ik.py) | Damped-least-squares position (+ optional orientation) IK for one arm, with a nullspace posture bias. |
+| [arm_ik.py](arm_ik.py) | Damped-least-squares position (+ optional orientation) IK for one arm, with a nullspace posture bias. Used by everything scripted. |
+| [weighted_arm_ik.py](weighted_arm_ik.py) | `WeightedArmIK` — a **parallel, teleop-only** weighted IK for one arm, default backend **mink** ([kevinzakka/mink](https://github.com/kevinzakka/mink), a MuJoCo-native differential-IK QP solved against the same `MjModel`). Same `sync()`/`solve()`/`site_pos()` surface as `ArmIK`; `TeleopController` opts in via `--teleop-weighted-ik` (default off — `arm_ik.py` and every scripted path untouched). The fix for `--teleop-orientation`: faithful gripper rotation on all three axes with a stable non-moving arm, where the DLS solver overshoots wildly. |
 | [approach_path.py](approach_path.py) | Re-targetable up/over/down approach path (`ApproachPath`) — any start → any goal, advanced one control step at a time. |
 | [verify_arm_ik.py](verify_arm_ik.py) | Headless verification for the IK solver + approach path. |
 | [grasp_primitive.py](grasp_primitive.py) | Dex3-1 hand shape (open/pre-grasp/closed via a grip scalar) and the grasp approach orientation. |
@@ -30,7 +31,7 @@ tabletop — the setup step before teleoperated pick-and-place / stacking contro
 | [verify_pick_sequence.py](verify_pick_sequence.py) | Headless regression check that `PickSequence`, driven one `.step()` per physics step (matching the live loop), reproduces `verify_grasp_hold.py`'s results. |
 | [stack_sequence.py](stack_sequence.py) | `StackSequence` — orchestrates pick-and-place cycles to build a stack on `brick1`. **In progress — major placement-collision cause found and fixed, a smaller landing-precision issue remains** — see CLAUDE.md's "Stacking Sequencing". |
 | [verify_stack_sequence.py](verify_stack_sequence.py) | Headless regression check for `StackSequence`; currently documents (and is expected to hit) the open placement failure rather than hiding it. `--record [OUTPUT.mp4]` saves an offscreen video of the run. |
-| [teleop_control.py](teleop_control.py) | `TeleopController` — continuous, per-frame two-arm VR-follow control (Phase 2's live-input counterpart to `PickSequence`), via the `televuer` package. Also `FpvStreamer` (streams the `fpv_teleop` camera to the headset) and `HandRetargeter` (real per-finger control via `dex_retargeting`, `--hand-tracking`). **First draft, never run against real hardware** — see CLAUDE.md's "Teleop Input (Phase 2, first draft)". |
+| [teleop_control.py](teleop_control.py) | `TeleopController` — continuous, per-frame two-arm VR-follow control (Phase 2's live-input counterpart to `PickSequence`), via the `televuer` package. Also `FpvStreamer` (streams the `fpv_teleop` camera to the headset) and `HandRetargeter` (real per-finger control via `dex_retargeting`, `--hand-tracking`). **Position tracking + FPV streaming confirmed on a real Quest 3S**; the mink weighted IK for orientation is sim-verified only — see CLAUDE.md's "Teleop Input (Phase 2)". |
 | [verify_teleop_control.py](verify_teleop_control.py) | Headless regression check for `TeleopController` against a synthetic input source — verifies the control-loop wiring, not the coordinate mapping against a real headset. |
 | [dex3_retargeting/](dex3_retargeting/) | Vendored, adapted Dex3-1 retargeting config + URDFs for `HandRetargeter` (see CLAUDE.md's "Teleop Input" for what was adapted and why). |
 | [verify_hand_retargeting.py](verify_hand_retargeting.py) | Headless regression check for hand-tracking mode against synthetic keypoints; skips gracefully if `dex_retargeting` isn't installed. |
@@ -45,6 +46,13 @@ tabletop — the setup step before teleoperated pick-and-place / stacking contro
 - For `--teleop` only (a real VR headset, e.g. Meta Quest 3S):
   ```bash
   pip install televuer   # see https://github.com/unitreerobotics/televuer for SSL cert setup
+  ```
+  On macOS the teleop launcher must run under **`mjpython`** (not `python3`) — a
+  `launch_passive` / Cocoa main-thread requirement.
+- For `--teleop-weighted-ik` only (the mink weighted IK that makes `--teleop-orientation`
+  faithful):
+  ```bash
+  pip install mink
   ```
 - For `--teleop --hand-tracking` only (real per-finger control instead of controller
   triggers) — the **upstream** `dex_retargeting`, not `unitreerobotics/xr_teleoperate`'s
@@ -97,13 +105,17 @@ python3 stand_next_to_table.py                       # third-person view, picks 
 python3 stand_next_to_table.py --view egocentric      # robot head POV
 python3 stand_next_to_table.py --pick brick2          # pick brick2 instead (also right arm)
 python3 stand_next_to_table.py --pick none            # just hold stance, no pick sequence
-python3 stand_next_to_table.py --teleop --cert-file cert.pem --key-file key.pem
-                                                       # live VR teleop, both arms (needs a
-                                                       # headset + `pip install televuer`;
-                                                       # first draft, unverified on real hardware)
-python3 stand_next_to_table.py --teleop --cert-file cert.pem --key-file key.pem --display-mode ego
-                                                       # same, plus streams the fpv_teleop
-                                                       # camera into the headset
+mjpython stand_next_to_table.py --teleop --cert-file cert.pem --key-file key.pem
+                                                       # live VR teleop, both arms — position
+                                                       # follow (needs a headset + televuer;
+                                                       # macOS: run under mjpython, not python3)
+mjpython stand_next_to_table.py --teleop --teleop-weighted-ik --teleop-orientation \
+         --display-mode immersive --record-episodes recordings/demo1 \
+         --cert-file cert.pem --key-file key.pem
+                                                       # faithful 6-DOF follow via the mink
+                                                       # weighted IK, head camera streamed to
+                                                       # the headset; press 's' in the viewer
+                                                       # to start a demo take, 's' again to save
 python3 stand_next_to_table.py --teleop --cert-file cert.pem --key-file key.pem --hand-tracking
                                                        # real per-finger control instead of
                                                        # controller triggers (needs
@@ -121,15 +133,51 @@ To check the arm IK solver headlessly (no GUI needed):
 python3 verify_arm_ik.py
 ```
 
+## Teleop loop
+
+`--teleop` runs `TeleopController` ([teleop_control.py](teleop_control.py)) — a continuous
+per-frame two-arm follow driven by a Meta Quest 3S over the
+[`televuer`](https://github.com/unitreerobotics/televuer) package. Each frame it reads both
+controller poses, applies their delta *since calibration* on top of a fixed `TELEOP_HOME`
+anchor pose, solves IK toward that target for each arm, and sets grip from the trigger. Legs
+and waist stay pinned to stance every step — only the arms/hands move.
+
+- **Calibration is gated** — at startup hold both controllers still in a relaxed, *symmetric*
+  pose (elbows ~90°, hands ~30 cm apart) until `teleop: calibrated` prints; the arms then
+  ramp up to `TELEOP_HOME` and start following. Press `c` in the viewer to recalibrate.
+- **Raw controller input is filtered** (single-frame glitch reject + EMA smoothing) and the
+  IK target is rate-limited, so a tracking dropout/snap can't slam the arm; a sustained
+  out-of-reach target makes the arm hold position instead of diverging. Operator range is
+  compressed onto the robot by `--teleop-scale` (default 0.5).
+- **IK: `--teleop-weighted-ik`** swaps the default DLS solver for `WeightedArmIK` with the
+  **mink** backend ([kevinzakka/mink](https://github.com/kevinzakka/mink), a MuJoCo-native
+  differential-IK QP). This is what makes **`--teleop-orientation`** (6-DOF follow) usable —
+  a 45° controller rotation maps to ~45° of gripper rotation on every axis with the
+  non-moving arm staying put, where the DLS solver overshoots wildly and drags the other arm
+  10+ cm. It also beats DLS on pure-position tracking. `arm_ik.py` and every scripted path
+  are untouched. (The G1's wrist actuators are torque-limited, so large wrist
+  reconfigurations still fall a few cm short — an arm-hardware limit no solver removes.)
+- **`--display-mode ego\|immersive`** streams the `fpv_teleop` camera to the headset
+  (`FpvStreamer`, mono). **`--record-episodes DIR`** samples frames + arm/hand joint
+  states/actions into per-episode datasets — press `s` in the viewer to start a take, `s`
+  again to stop and save (repeat for more takes).
+
+**Confirmed on a real Quest 3S:** position tracking of both arms and FPV streaming. The mink
+weighted IK for orientation is verified in sim, not yet on the headset. On macOS the launcher
+must run under `mjpython`. See CLAUDE.md's "Teleop Input (Phase 2)" for the full record.
+
 ## Scene contents
 
 - **Robot**: Unitree G1, base welded to the world (no balance controller — it's not needed
   since the pelvis can't move), holding a stance pose. 43 actuators: legs, waist, arms, and a
   3-finger Dex3-1 dexterous hand per wrist.
 - **Table**: wooden tabletop with top surface at `z = 0.74 m`.
-- **Bricks**: three `yellowPLAEXLong` bricks (~7.9 × 3.75 × 3.45 cm), resting on the table at
-  different orientations at `x=0.28` (within confirmed arm reach — see `verify_arm_ik.py`),
-  ready to be picked up.
+- **Bricks**: three `yellowPLAEXLong` bricks, resting on the table at different orientations
+  at `x=0.28` (within confirmed arm reach — see `verify_arm_ik.py`), ready to be picked up.
+  Enlarged from the original ~7.9 × 3.75 × 3.45 cm to **~13.1 × 6.25 × 5.75 cm** (L × W × H
+  for an un-yawed brick; mesh `scale` 0.015 → 0.025, ~283 g at `density=600`) to test
+  graspability under VR teleop. `brick1` sits at `y=-0.20` (moved from `-0.15`) so its
+  collision box clears the 90°-yawed `brick2` at the larger size.
 - **Camera**: `fpv_teleop`, mounted on the torso and tilted down toward the tabletop — pass
   `--view egocentric` to see through it.
 
@@ -147,7 +195,7 @@ python3 verify_arm_ik.py
 - [x] Grasp control loop wired into `stand_next_to_table.py` — `PickSequence` drives approach → orient → close → lift → hold live, per frame (`--pick`); see CLAUDE.md's "Wired-In Control Loop"
 - [ ] `brick3` (left arm) grasp-approach geometry — known open issue, now also confirmed unable to reach the chosen stack location; see CLAUDE.md
 - [~] Stacking sequencing — location/order/arm assignment decided, `StackSequence` built; the major collision cause (the hand's own fingers hitting `brick1`, fixed via release-from-hover) dropped base-brick displacement from ~80cm to ~11cm, but a smaller horizontal landing-precision issue remains — see CLAUDE.md's "Stacking Sequencing"
-- [~] Teleop input mapping — `TeleopController` (via `televuer`, Quest 3S controllers), FPV streaming (`FpvStreamer`), and real per-finger hand-tracking (`HandRetargeter`, via upstream `dex_retargeting`) all exist and pass headless verification, but have **never been run against real VR hardware**; see CLAUDE.md's "Teleop Input (Phase 2, first draft)"
+- [~] Teleop input — `TeleopController` (via `televuer`, Quest 3S controllers): **position tracking of both arms and FPV streaming confirmed on a real Quest 3S**. `--teleop-orientation` via the **mink** weighted IK (`--teleop-weighted-ik`) gives faithful 6-DOF follow — verified in sim, headset run pending. Hand-tracking (`HandRetargeter`, upstream `dex_retargeting`) exists but is untested with real keypoints. See CLAUDE.md's "Teleop Input (Phase 2)"
 
 ## Verifying a change
 

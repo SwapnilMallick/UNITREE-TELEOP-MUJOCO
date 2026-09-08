@@ -117,14 +117,15 @@ def main():
     finally:
         shutil.rmtree(task_dir, ignore_errors=True)
 
-    multi_episode()
+    toggle_segmentation()
 
 
-def multi_episode():
-    """Exercises the 'n'-key episode-segmentation path added to
-    stand_next_to_table.py's loop: end_episode() then retry start_episode()
-    each frame until the async previous-save drains, keep recording, and end
-    up with two independent, well-formed episode dirs from one sim run."""
+def toggle_segmentation():
+    """Exercises the 's'-toggle episode path in stand_next_to_table.py's loop:
+    nothing records until the first 's'; 's' starts an episode, 's' again
+    finalizes+saves it (retrying start_episode() each frame while the async
+    previous-save drains), repeat. Ends up with two independent, well-formed
+    episode dirs from one sim run, and NO samples written while stopped."""
     m = mujoco.MjModel.from_xml_path(str(SCENE))
     d = mujoco.MjData(m)
     key_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_KEY, "stand_at_table")
@@ -133,33 +134,48 @@ def multi_episode():
     d.ctrl[:] = hold
     mujoco.mj_forward(m, d)
 
-    task_dir = tempfile.mkdtemp(prefix="verify_episode_recording_multi_")
+    task_dir = tempfile.mkdtemp(prefix="verify_episode_recording_toggle_")
     try:
-        rec = EpisodeRecorder(m, task_dir=task_dir, fps=10, goal="multi take",
+        rec = EpisodeRecorder(m, task_dir=task_dir, fps=10, goal="toggle take",
                                extra_bodies=["brick1", "brick2", "brick3"])
-        assert rec.start_episode()
+        # NOT started here -- the first 's' does it, matching the new wiring.
+        assert not rec.is_recording
 
         seq = PickSequence(m, "right", "right_gripper_site", RIGHT_ARM, RIGHT_HAND, "brick1")
         seq.start(m, d)
         dt = m.opt.timestep
-        counts = []
-        n = 0
-        want_next, awaiting_next = False, False
+        state = {"toggle": False, "awaiting_start": False}
+        episode_n = 0
+        # 's' presses scheduled (frame -> registered, handled next frame, like
+        # the async key_callback): start, stop, start, stop.
+        presses = {int(0.3 / dt), int(2.5 / dt), int(3.0 / dt), int(5.4 / dt)}
+        samples_while_stopped = 0
         for i in range(int(6.0 / dt)):
             seq.step(m, d, hold)
             mujoco.mj_step(m, d)
-            # mirror stand_next_to_table.py's loop exactly
-            if want_next:
-                rec.end_episode()
-                want_next, awaiting_next = False, True
-            if awaiting_next and rec.start_episode():
-                awaiting_next = False
-                n += 1
-            rec.step(m, d)
-            if i == int(3.0 / dt):   # request the cut halfway through
-                want_next = True
+            # --- mirror stand_next_to_table.py's loop exactly ---
+            if state["toggle"]:
+                state["toggle"] = False
+                if rec.is_recording:
+                    rec.end_episode()
+                elif state["awaiting_start"]:
+                    state["awaiting_start"] = False
+                else:
+                    state["awaiting_start"] = True
+            if state["awaiting_start"] and rec.start_episode():
+                state["awaiting_start"] = False
+                episode_n += 1
+            sampled = rec.step(m, d)
+            # ---------------------------------------------------
+            if not rec.is_recording and sampled:
+                samples_while_stopped += 1
+            if i in presses:
+                state["toggle"] = True
         rec.end_episode()
         rec.close()
+
+        assert samples_while_stopped == 0, "recorded frames while stopped between/before takes"
+        assert episode_n == 2, f"expected 2 episodes started via toggle, got {episode_n}"
 
         episode_dirs = sorted(pathlib.Path(task_dir).glob("episode_*"))
         assert len(episode_dirs) == 2, f"expected 2 episode dirs, found {episode_dirs}"
@@ -169,9 +185,10 @@ def multi_episode():
             assert len(episode["data"]) > 3, f"{ep.name} has too few samples"
             img_rel = episode["data"][0]["colors"]["fpv_teleop"]
             assert (ep / img_rel).exists(), f"{ep.name}: first image missing"
-        print(f"multi-episode: 2 dirs, "
-              f"{[len(json.load(open(ep / 'data.json'))['data']) for ep in episode_dirs]} samples")
-        print("multi-episode: PASS")
+        print(f"toggle-segmentation: 2 dirs, "
+              f"{[len(json.load(open(ep / 'data.json'))['data']) for ep in episode_dirs]} samples, "
+              f"0 samples while stopped")
+        print("toggle-segmentation: PASS")
     finally:
         shutil.rmtree(task_dir, ignore_errors=True)
 

@@ -156,8 +156,19 @@ TELEOP_HOME = {"left": (0.24, 0.14, 0.82), "right": (0.24, -0.14, 0.82)}  # worl
 # gives a different wrist config). --teleop-orientation uses this as the
 # reference so a zero controller-rotation delta holds HOME cleanly instead of
 # fighting between the position and a wrong orientation target.
+#
+# THIS IS SOLVER-SPECIFIC. Measured for arm_ik.py's DLS solver; when
+# --teleop-weighted-ik picks solver="mink" it settles at a genuinely
+# DIFFERENT natural orientation (confirmed empirically: ~57deg apart from
+# this constant) -- reusing this one for mink recreates exactly the
+# "position fights orientation" problem this constant was invented to avoid
+# in the first place, just for a different solver (measured: it held HOME
+# position to only ~6-7cm instead of <1cm before MINK_HOME_QUAT existed).
+# calibrate() picks the matching constant based on the active solver.
 TELEOP_HOME_QUAT = {"left":  (0.507,  -0.5578, 0.5105,  0.4138),
                     "right": (0.5061,  0.5585, 0.5113, -0.4129)}
+MINK_HOME_QUAT = {"left":  (0.7473, -0.2144, 0.4965,  0.386),
+                  "right": (0.7475,  0.214,  0.4968, -0.3855)}
 
 # --- calibration gating (see TeleopController.try_calibrate) ---
 # calibrate() captures the paired reference the ENTIRE delta mapping is built
@@ -194,13 +205,19 @@ MAX_TARGET_DELTA = 0.50       # m; secondary guard -- an IK target this far from
 # EMA-smooth what's left, and rate-limit how fast the IK target may translate.
 # (xr_teleoperate ships weighted_moving_filter.py for the same reason.)
 IK_ITERS = 8                 # per-frame IK iterations (was 4) -- track a moving target better
-TELEOP_ORI_WEIGHT = 0.4      # --teleop-orientation (EXPERIMENTAL) only. arm_ik's DLS solver
-                              # behaves erratically under a 6-DOF task at these tabletop poses
-                              # -- measured: a 60deg controller rotation produces anywhere from
-                              # ~25 to ~140deg of gripper rotation depending on axis, and
-                              # position degrades 10-25cm. No weight tested fixes it. Real
-                              # grasp-alignment orientation needs a weighted (Pinocchio/CasADi)
-                              # IK, not this. This weight is just "least bad".
+TELEOP_ORI_WEIGHT = 0.4      # --teleop-orientation (EXPERIMENTAL) only, with the DEFAULT
+                              # arm_ik.py DLS solver. That solver behaves erratically under a
+                              # 6-DOF task at these tabletop poses -- measured: a 60deg
+                              # controller rotation produces anywhere from ~25 to ~140deg of
+                              # gripper rotation depending on axis, and position degrades
+                              # 10-25cm. No weight tested fixes it. This weight is just
+                              # "least bad". The real fix is --teleop-weighted-ik below.
+TELEOP_WEIGHTED_ORI_WEIGHT = 1.0  # --teleop-orientation with --teleop-weighted-ik
+                              # (weighted_arm_ik.WeightedArmIK). That solver keeps position a
+                              # high-weight term (pos_weight >> ori_weight internally), so an
+                              # infeasible orientation request can't trade position away --
+                              # 1.0 here is a straightforward orientation weight, not a
+                              # damped-down "least bad" one.
 VR_FILTER_ALPHA = 0.2        # EMA weight on the new (accepted) controller pose each frame
 VR_GLITCH_TOL = 0.10         # m; a single-frame controller jump larger than this is a
                               # tracking dropout/reacquire, not a hand -- rejected, hold last
@@ -296,7 +313,8 @@ class TeleopController:
     """
 
     def __init__(self, m, hand_retargeter=None, debug=False, track_orientation=False,
-                 scale=SCALE):
+                 scale=SCALE, weighted_ik=False, weighted_ik_mjcf=None,
+                 weighted_ik_solver="mink"):
         """hand_retargeter, if given (a HandRetargeter instance), switches
         hand control from the controller-trigger path (hand_ctrl/
         trigger_to_grip) to real per-finger retargeting from tele_data's
@@ -311,18 +329,51 @@ class TeleopController:
         residual from step() -- for diagnosing the arm not tracking.
 
         track_orientation=False (default) runs POSITION-ONLY IK. True adds a
-        6-DOF solve following the controller's rotation-since-calibration --
-        **EXPERIMENTAL and known to be poor**: arm_ik's DLS solver is erratic
-        under a 6-DOF task at these tabletop poses (a controller rotation maps
-        to a wildly axis-dependent gripper rotation, and position degrades
-        10-25cm). It gives the operator *some* orientation influence but not
-        faithful control. Real grasp-alignment orientation needs a weighted
-        (Pinocchio/CasADi) IK replacing arm_ik -- see TELEOP_ORI_WEIGHT.
+        6-DOF solve following the controller's rotation-since-calibration. With
+        the default arm_ik DLS solver this is **EXPERIMENTAL and poor** (a
+        controller rotation maps to a wildly axis-dependent gripper rotation,
+        position degrades 10-25cm). Pair it with weighted_ik=True for faithful
+        orientation follow -- see below.
+
+        weighted_ik=False (default) uses arm_ik.py's DLS ArmIK -- the same
+        solver as the whole scripted pipeline, and the confirmed-working
+        position teleop. weighted_ik=True swaps in
+        weighted_arm_ik.WeightedArmIK (default backend: mink, a MuJoCo-native
+        differential-IK QP library -- see weighted_arm_ik.py's docstring),
+        the --teleop-weighted-ik flag. It is the fix for track_orientation: a
+        controller rotation produces a faithful gripper rotation on ALL
+        THREE axes (not the DLS solver's wild axis-dependent overshoot), the
+        moving arm holds position, and the OTHER arm stays essentially
+        perfectly still (DLS drifts it 13-17cm; mink ~0.00cm). Position
+        tracking is at least as good as DLS across every regime tested (see
+        weighted_arm_ik.py's docstring for the full measured table,
+        including a shared torque-saturation limit at fully-extended low
+        reaches that mink narrows but no IK can eliminate). weighted_ik_mjcf
+        is only used by the "lm"/"ipopt" fallback solvers (mink builds
+        directly from `m`); weighted_ik_solver is "mink" (default), "lm"
+        (Pinocchio weighted LM, ~1ms, no mink dependency), or "ipopt"
+        (CasADi/IPOPT, slower -- decimate it).
+        If this path misbehaves on the headset, drop weighted_ik and you're
+        back on the working DLS teleop with zero impact on any scripted work.
 
         scale (default SCALE) is the controller-motion -> robot-motion factor;
         step()'s own scale= arg still overrides per call."""
-        self._iks = {side: ArmIK(m, site_name, arm_slice)
-                     for side, site_name, arm_slice, _ in _SIDES}
+        self._weighted_ik = weighted_ik
+        self._weighted_ik_solver = weighted_ik_solver
+        if weighted_ik:
+            from weighted_arm_ik import WeightedArmIK
+            if weighted_ik_solver != "mink" and weighted_ik_mjcf is None:
+                raise ValueError("weighted_ik_solver='lm'/'ipopt' needs "
+                                 "weighted_ik_mjcf (path to g1_fixed_upper.xml "
+                                 "in MODEL_DIR) -- the default solver='mink' "
+                                 "doesn't need it.")
+            self._iks = {side: WeightedArmIK(m, site_name, arm_slice,
+                                             mjcf_path=weighted_ik_mjcf,
+                                             solver=weighted_ik_solver, debug=debug)
+                         for side, site_name, arm_slice, _ in _SIDES}
+        else:
+            self._iks = {side: ArmIK(m, site_name, arm_slice)
+                         for side, site_name, arm_slice, _ in _SIDES}
         # body that carries each arm's first joint -- the shoulder anchor the
         # REACH_RADIUS workspace clamp is centred on (fixed: base welded, torso
         # pinned, so captured once in calibrate() from the live d.xpos)
@@ -436,7 +487,10 @@ class TeleopController:
             # (measured constant -- see TELEOP_HOME_QUAT), not the current stance
             # orientation and not a bare IK solve (both differ, and the mismatch
             # makes the 6-DOF solve fight position vs. a wrong orientation).
-            self._robot_ref_quat[side] = np.array(TELEOP_HOME_QUAT[side], dtype=float)
+            # solver-specific -- see the MINK_HOME_QUAT comment above
+            home_quat = (MINK_HOME_QUAT if self._weighted_ik and
+                        self._weighted_ik_solver == "mink" else TELEOP_HOME_QUAT)
+            self._robot_ref_quat[side] = np.array(home_quat[side], dtype=float)
             self._shoulder_pos[side] = d.xpos[self._shoulder_bid[side]].copy()
             vr_pos, vr_quat = _se3_to_pos_quat(getattr(tele_data, f"{side}_wrist_pose"))
             self._vr_ref_pos[side] = vr_pos
@@ -562,8 +616,10 @@ class TeleopController:
                 # natural HOME orientation
                 quat_delta = _relative_quat(self._vr_ref_quat[side], vr_quat)
                 target_quat = _apply_relative_quat(quat_delta, self._robot_ref_quat[side])
+                ori_w = (TELEOP_WEIGHTED_ORI_WEIGHT if self._weighted_ik
+                         else TELEOP_ORI_WEIGHT)
                 q = ik.solve(target_pos, target_quat=target_quat, iters=IK_ITERS,
-                             ori_weight=TELEOP_ORI_WEIGHT)
+                             ori_weight=ori_w)
             else:
                 target_quat = None  # position-only IK -- see __init__ docstring
                 q = ik.solve(target_pos, iters=IK_ITERS)

@@ -81,6 +81,12 @@ class EpisodeRecorder:
         self._step_count = 0
         return ok
 
+    @property
+    def is_recording(self):
+        """True between a successful start_episode() and its end_episode() --
+        lets a caller drive a start/stop toggle without poking internals."""
+        return self._recording
+
     def step(self, m, d):
         """Call once per control step. Internally rate-limited to ~fps; most
         calls are a no-op by design. Returns True on steps a sample was

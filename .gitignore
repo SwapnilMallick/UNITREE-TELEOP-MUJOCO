@@ -6,3 +6,7 @@ certs/
 recordings/
 CLAUDE.md
 *.txt
+/brick_size_check/
+/assets/
+commands
+.DS_Store

@@ -34,7 +34,11 @@ since no headset is reachable from this dev environment).
                                                           # (episode_recording.py) -- works with
                                                           # any driver (--pick, --teleop, ...),
                                                           # runs in parallel, not wired into any
-                                                          # of them
+                                                          # of them. Press 's' in the viewer to
+                                                          # start an episode, 's' again to stop
+                                                          # and save it, and so on (xr_teleoperate's
+                                                          # convention) -- nothing records until
+                                                          # the first 's'.
 """
 import argparse, time, pathlib, os
 import numpy as np
@@ -114,7 +118,10 @@ def parse_args():
                               "EpisodeRecorder (episode_recording.py), into DIR in "
                               "xr_teleoperate's own per-episode data.json format. Works "
                               "alongside any driver (--pick, --teleop, or --pick none) -- "
-                              "runs in parallel, not wired into any of them. Off by default.")
+                              "runs in parallel, not wired into any of them. Press 's' in "
+                              "the viewer to start an episode and 's' again to stop and save "
+                              "it (repeat for more takes); nothing records until the first "
+                              "'s'. Off by default.")
     parser.add_argument("--teleop-debug", action="store_true",
                          help="with --teleop, print calibration + per-frame IK diagnostics "
                               "(captured reference poses, |pos_delta|, IK target, residual) "
@@ -133,6 +140,26 @@ def parse_args():
                               "range is bigger than this arm's ~0.45m envelope, so <1.0 "
                               "keeps targets reachable. Lower if the arm still hits limits; "
                               "raise toward 1.0 if motion feels sluggish.")
+    parser.add_argument("--teleop-weighted-ik", action="store_true",
+                         help="with --teleop, use weighted_arm_ik.WeightedArmIK instead "
+                              "of arm_ik.py's DLS solver. This is the fix for "
+                              "--teleop-orientation: a controller rotation produces a "
+                              "faithful gripper rotation on all three axes (not the DLS "
+                              "solver's wild axis-dependent overshoot), the moving arm "
+                              "holds position, and the other arm stays essentially "
+                              "perfectly still. Position tracking is at least as good as "
+                              "DLS across every regime tested. Default backend 'mink' "
+                              "needs `pip install mink`; 'lm' needs only pinocchio (no new "
+                              "dep beyond what dex_retargeting already installs). Does NOT "
+                              "affect any scripted pick/stack path (arm_ik.py is "
+                              "untouched). Default: off.")
+    parser.add_argument("--teleop-weighted-ik-solver", choices=["mink", "lm", "ipopt"],
+                         default="mink",
+                         help="weighted-IK backend (with --teleop-weighted-ik): 'mink' "
+                              "(default -- MuJoCo-native QP IK, faithful on all axes, "
+                              "~0.7ms), 'lm' (Pinocchio weighted Levenberg-Marquardt, "
+                              "~1ms, only Z-axis-faithful, kept as a mink-free fallback), "
+                              "or 'ipopt' (CasADi/IPOPT NLP, slower -- runs decimated).")
     return parser.parse_args()
 
 def main():
@@ -209,7 +236,20 @@ def main():
                          track_orientation=args.teleop_orientation)
         if args.teleop_scale is not None:
             teleop_kw["scale"] = args.teleop_scale   # else TeleopController's own default
-        teleop_ctrl = TeleopController(m, **teleop_kw)
+        if args.teleop_weighted_ik:
+            teleop_kw["weighted_ik"] = True
+            teleop_kw["weighted_ik_mjcf"] = str(MODEL_DIR / "g1_fixed_upper.xml")
+            teleop_kw["weighted_ik_solver"] = args.teleop_weighted_ik_solver
+        try:
+            teleop_ctrl = TeleopController(m, **teleop_kw)
+        except ImportError as e:
+            raise SystemExit(
+                "--teleop-weighted-ik needs its solver deps:\n"
+                "  solver 'mink'  (default) -> pip install mink\n"
+                "  solver 'lm'    -> pinocchio (already a dex_retargeting dep here)\n"
+                "  solver 'ipopt' -> pip install casadi\n"
+                f"({e})"
+            ) from e
         fpv_streamer = (FpvStreamer(m, EGOCENTRIC_CAMERA)
                          if args.display_mode != "pass-through" else None)
         print(f"teleop: waiting for headset connection + first "
@@ -225,8 +265,8 @@ def main():
     # step and never touches d.ctrl, so it records identically regardless of
     # the driver. See episode_recording.py.
     recorder = None
-    episode_n = 1
-    record_state = {"want_next": False, "awaiting_next": False}
+    episode_n = 0
+    record_state = {"toggle": False, "awaiting_start": False}
     calib_state = {"waiting_printed": False}  # for the 'hold still to calibrate' hint
     if args.record_episodes is not None:
         if args.teleop:
@@ -238,20 +278,18 @@ def main():
         recorder = EpisodeRecorder(m, task_dir=str(args.record_episodes),
                                     goal=episode_goal,
                                     extra_bodies=list(PICK_TARGETS))  # brick1/2/3 ground truth
-        if not recorder.start_episode():
-            raise SystemExit(f"could not start recording in {args.record_episodes}/ "
-                              f"(EpisodeWriter reported busy at startup -- unexpected)")
-        print(f"recording episode {episode_n} into {args.record_episodes}/ -- press 'n' in "
-              f"the viewer window to save it and begin the next take")
+        print(f"episode recording armed -- press 's' in the viewer window to start an "
+              f"episode into {args.record_episodes}/, 's' again to stop and save it "
+              f"(repeat for more takes). Nothing records until the first 's'.")
 
     def key_callback(keycode):
         # GLFW reports letter keys as their uppercase ASCII code.
-        # 'n' -> finalize the current episode and start a fresh one, so one
-        #        session can capture many takes without restarting the sim.
+        # 's' -> toggle episode recording: first press starts an episode, next
+        #        press finalizes+saves it, and so on (xr_teleoperate's convention).
         # 'c' -> drop teleop calibration and re-capture a fresh reference,
         #        so a bad initial capture is recoverable without a restart.
-        if recorder is not None and keycode == ord("N"):
-            record_state["want_next"] = True
+        if recorder is not None and keycode == ord("S"):
+            record_state["toggle"] = True
         if teleop_ctrl is not None and keycode == ord("C"):
             teleop_ctrl.request_recalibration()
             calib_state["waiting_printed"] = False
@@ -331,19 +369,29 @@ def main():
                 mujoco.mj_step(m, d)
 
                 if recorder is not None:
-                    # 'n' key -> save this take and roll to the next. create_episode()
-                    # is async (returns False while the previous save drains), so retry
-                    # each frame until it takes.
-                    if record_state["want_next"]:
-                        recorder.end_episode()
-                        record_state["want_next"] = False
-                        record_state["awaiting_next"] = True
-                    if record_state["awaiting_next"] and recorder.start_episode():
-                        record_state["awaiting_next"] = False
+                    # 's' key toggles recording (xr_teleoperate's convention):
+                    # 1st press starts an episode, next press finalizes+saves it.
+                    if record_state["toggle"]:
+                        record_state["toggle"] = False
+                        if recorder.is_recording:
+                            recorder.end_episode()
+                            print(f"\nrecording stopped -- episode {episode_n} saved "
+                                  f"under {args.record_episodes}/")
+                        elif record_state["awaiting_start"]:
+                            record_state["awaiting_start"] = False
+                            print("\nrecording start cancelled (episode never began)")
+                        else:
+                            record_state["awaiting_start"] = True
+                    # create_episode() is async (returns False while the previous
+                    # save drains), so retry each frame until it takes.
+                    if record_state["awaiting_start"] and recorder.start_episode():
+                        record_state["awaiting_start"] = False
                         episode_n += 1
-                        print(f"\nrecording episode {episode_n} into {args.record_episodes}/")
+                        print(f"\nrecording episode {episode_n} into {args.record_episodes}/ "
+                              f"-- press 's' again to stop and save")
                     # one sample per control step; internally rate-limited to the
-                    # writer's fps, so most calls are a no-op (see EpisodeRecorder)
+                    # writer's fps, so most calls are a no-op (see EpisodeRecorder).
+                    # No-ops entirely while stopped/between episodes.
                     recorder.step(m, d)
 
                 viewer.sync()
@@ -352,9 +400,43 @@ def main():
                     time.sleep(dt)
         finally:
             if recorder is not None:
+                # flush an episode still in progress at viewer close / Ctrl-C
+                # (end_episode() no-ops if 's' already stopped it); close()
+                # joins the writer's non-daemon worker thread either way.
+                was_recording = recorder.is_recording
                 recorder.end_episode()
                 recorder.close()
-                print(f"\nepisode recording(s) saved under {args.record_episodes}/")
+                if episode_n > 0:
+                    tail = " (in-progress take flushed)" if was_recording else ""
+                    print(f"\n{episode_n} episode(s) saved under "
+                          f"{args.record_episodes}/{tail}")
+                else:
+                    print("\nno episodes recorded ('s' was never pressed)")
+
+            # Explicitly tear down the offscreen renderers (their __del__ can
+            # otherwise throw a noisy 'Exception ignored' during interpreter
+            # shutdown) ...
+            for _obj in (fpv_streamer, recorder):
+                _r = getattr(_obj, "renderer", None)
+                if _r is not None:
+                    try:
+                        _r.close()
+                    except Exception:
+                        pass
+
+            # ... and, crucially, close televuer: TeleVuerWrapper.close()
+            # terminates its vuer server child process, stops the render-loop
+            # thread, and unlink()s the img2display SharedMemory block. Without
+            # this the leaked shared-memory segment + zmq resources keep the
+            # process from exiting after the viewer window closes.
+            if tele_source is not None and hasattr(tele_source, "close"):
+                try:
+                    tele_source.close()
+                except Exception as e:
+                    print(f"teleop: tele_source.close() raised {e!r} (ignored)")
+
+    # tell __main__ whether televuer was in play (see the hard-exit note there)
+    return tele_source is not None
 
 if __name__ == "__main__":
     # televuer spawns its own server as a child process. Python's multiprocessing
@@ -371,4 +453,14 @@ if __name__ == "__main__":
         multiprocessing.set_start_method("fork")
     except RuntimeError:
         pass  # already set (e.g. re-imported) -- fine, don't fail on it
-    main()
+    used_televuer = main()
+    if used_televuer:
+        # Even after TeleVuerWrapper.close(), the televuer/vuer child + macOS
+        # "fork" start method can leave this process wedged at interpreter
+        # shutdown (leaked SharedMemory / zmq / an unjoinable native thread),
+        # so it never returns to the shell. All of our own cleanup and prints
+        # have already run in main()'s finally, so exit hard instead of hanging.
+        import sys
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)

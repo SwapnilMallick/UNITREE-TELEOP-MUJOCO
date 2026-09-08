@@ -13,10 +13,16 @@
     <material name="wood" rgba="0.66 0.48 0.30 1"/>
     <material name="plaex_yellow" rgba="1 0.9 0 1"/>
     <!-- yellowPLAEXLong.obj from BRICK-SIMULATOR-3D-MUJOCO/BlenderFiles, raw Blender export
-         (Y-up). scale=0.015 -> 7.875 x 3.75 x 3.45 cm, a graspable tabletop-brick size
-         (the source project's own 0.1 m/unit convention is for a much larger dam-building
-         scale and isn't used here). -->
-    <mesh name="yellow_plaex_long" file="yellowPLAEXLong.obj" scale="0.015 0.015 0.015"/>
+         (Y-up). Raw mesh AABB = 5.25 x 2.30 x 2.50 units (mesh-local X,Y,Z).
+         scale=0.025 -> 13.125 x 5.75 x 6.25 cm (mesh-local X,Y,Z). After each
+         brick's +90deg-about-X visual correction quat, an un-yawed brick sits on
+         the table as L x W x H = 13.125 (world X, toward robot) x 6.25 (world Y,
+         lateral) x 5.75 (world Z, height) cm; the collision box matches. ENLARGED
+         from the original scale=0.015 (7.875 x 3.45 x 3.75 cm mesh-local) to test
+         whether the bricks are graspable under VR teleop -- see CLAUDE.md
+         "Brick Assets". The source project's own 0.1 m/unit dam-building
+         convention is unrelated and not used here. -->
+    <mesh name="yellow_plaex_long" file="yellowPLAEXLong.obj" scale="0.025 0.025 0.025"/>
   </asset>
   <worldbody>
     <geom name="floor" size="0 0 0.05" type="plane" material="grid"/>
@@ -47,8 +53,14 @@
          fine -- confirmed the pregrasp height wasn't the cause (self-collision
          persisted up to 20cm above the brick) and that only a lateral shift
          resolved it. At y=-0.07 the right arm reaches it with the self-collision
-         gone and ~1.6cm error; confirmed no brick1<->brick2 collision-geom
-         overlap at rest. See CLAUDE.md's "Arm IK" section.
+         gone and ~1.6cm error. See CLAUDE.md's "Arm IK" section.
+         brick1's y moved from -0.15 to -0.20: at the enlarged scale=0.025 the
+         brick1 (un-yawed, world-Y half 3.125cm) and brick2 (90deg yaw, world-Y
+         half 6.56cm) collision boxes overlapped ~2cm along Y at the old 8cm
+         centre spacing. y=-0.20 gives a ~3cm clear gap between the two boxes at
+         the keyframe. brick2 kept at -0.07 (moving it toward centre reopens the
+         self-collision above). Re-run verify_arm_ik.py -- brick1's pick target
+         moved ~5cm.
          The mesh's local axes need a fixed +90deg-about-X correction (Blender Y-up
          -> MuJoCo Z-up, see BRICK-SIMULATOR-3D-MUJOCO/CLAUDE.md); expressed as a
          quat (not euler) because this document's compiler angle="radian" and a
@@ -59,28 +71,28 @@
          sides of the same contact pair, tuned together against a real grasp+lift+hold
          test (verify_grasp_hold.py), not independently. See CLAUDE.md's "Grasp
          Primitive" section. -->
-    <body name="brick1" pos="0.28 -0.15 0.758">
+    <body name="brick1" pos="0.28 -0.20 0.768">
       <freejoint/>
       <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
             quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
-      <geom name="brick1_collision" type="box" size="0.039375 0.01875 0.01725"
-            pos="-0.001875 0 0.00225" density="600" group="3"
+      <geom name="brick1_collision" type="box" size="0.065625 0.03125 0.02875"
+            pos="-0.003125 0 0.00375" density="600" group="3"
             friction="3 0.5 0.3" solref="0.005 1"/>
     </body>
-    <body name="brick2" pos="0.28 -0.07 0.758" quat="0.7071068 0 0 0.7071068">
+    <body name="brick2" pos="0.28 -0.07 0.768" quat="0.7071068 0 0 0.7071068">
       <freejoint/>
       <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
             quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
-      <geom name="brick2_collision" type="box" size="0.039375 0.01875 0.01725"
-            pos="-0.001875 0 0.00225" density="600" group="3"
+      <geom name="brick2_collision" type="box" size="0.065625 0.03125 0.02875"
+            pos="-0.003125 0 0.00375" density="600" group="3"
             friction="3 0.5 0.3" solref="0.005 1"/>
     </body>
-    <body name="brick3" pos="0.28 0.18 0.758" quat="0.9659258 0 0 0.258819">
+    <body name="brick3" pos="0.28 0.18 0.768" quat="0.9659258 0 0 0.258819">
       <freejoint/>
       <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
             quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
-      <geom name="brick3_collision" type="box" size="0.039375 0.01875 0.01725"
-            pos="-0.001875 0 0.00225" density="600" group="3"
+      <geom name="brick3_collision" type="box" size="0.065625 0.03125 0.02875"
+            pos="-0.003125 0 0.00375" density="600" group="3"
             friction="3 0.5 0.3" solref="0.005 1"/>
     </body>
   </worldbody>
@@ -95,9 +107,9 @@
   <keyframe>
     <key name="stand_at_table"
       qpos="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.2 0.2 0 1.28 0 0 0 0 1.05 0 0 0 0 0 0.2 -0.2 0 1.28 0 0 0 0 -1.05 0 0 0 0 0
-            0.28 -0.15 0.758 1 0 0 0
-            0.28 -0.07 0.758 0.7071068 0 0 0.7071068
-            0.28 0.18 0.758 0.9659258 0 0 0.258819"
+            0.28 -0.20 0.768 1 0 0 0
+            0.28 -0.07 0.768 0.7071068 0 0 0.7071068
+            0.28 0.18 0.768 0.9659258 0 0 0.258819"
       ctrl="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.2 0.2 0 1.28 0 0 0 0 1.05 0 0 0 0 0 0.2 -0.2 0 1.28 0 0 0 0 -1.05 0 0 0 0 0"/>
   </keyframe>
 </mujoco>
