@@ -1,8 +1,11 @@
-# Unitree G1 Tabletop Teleop Scaffold
+# Unitree G1 Tabletop Teleoperation in MuJoCo
 
-A fixed-base (welded) Unitree G1 humanoid standing next to a table in MuJoCo, holding a
-stance pose, with a working first-person head camera and three bricks resting on the
-tabletop — the setup step before teleoperated pick-and-place / stacking control.
+A fixed-base (welded) Unitree G1 humanoid standing next to a table in MuJoCo, teleoperated
+from a Meta Quest 3S to pick, place, and stack bricks — with the first-person head camera
+streamed to the headset and per-episode demo recording. Both arms following the controllers
+(position) is confirmed on real hardware, along with a scripted pick-lift-hold sequence;
+faithful 6-DOF orientation follow (via the mink weighted IK) and brick stacking are in
+progress.
 
 <p float="left">
   <img src="https://img.shields.io/badge/MuJoCo-%3E%3D3.2-blue" alt="mujoco>=3.2">
