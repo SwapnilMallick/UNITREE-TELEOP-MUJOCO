@@ -39,6 +39,11 @@ since no headset is reachable from this dev environment).
                                                           # and save it, and so on (xr_teleoperate's
                                                           # convention) -- nothing records until
                                                           # the first 's'.
+
+Viewer keys: 's' toggles episode recording, 'c' re-runs teleop calibration,
+'r' resets the three bricks to their stand_at_table pose. In --teleop, the
+left controller's X button does the same brick reset as 'r' (UNVERIFIED
+against a real headset -- see the comment at its wiring in main()).
 """
 import argparse, time, pathlib, os
 import numpy as np
@@ -59,6 +64,34 @@ PICK_TARGETS = {
     "brick2": ("right", "right_gripper_site", RIGHT_ARM, RIGHT_HAND, "brick2"),
     "brick3": ("left",  "left_gripper_site",  LEFT_ARM,  LEFT_HAND,  "brick3"),
 }
+
+def _free_joint_slices(m, body_name):
+    """qpos (7: xyz + wxyz quat) and qvel (6: linear + angular) slices for a
+    free-jointed body, looked up by name -- used by reset_bricks() below to
+    teleport a brick back to a captured pose without assuming a fixed index
+    (bricks sit after the robot's 43 qpos, but that's an implementation
+    detail this doesn't hardcode)."""
+    bid = m.body(body_name).id
+    jid = m.body_jntadr[bid]
+    assert m.jnt_type[jid] == mujoco.mjtJoint.mjJNT_FREE, f"{body_name} has no freejoint"
+    qa = m.jnt_qposadr[jid]
+    va = m.jnt_dofadr[jid]
+    return slice(qa, qa + 7), slice(va, va + 6)
+
+
+def reset_bricks(m, d, brick_reset):
+    """Teleport all three bricks back to their captured (position + orientation)
+    pose and zero their velocity -- used by the 'R' key and, in --teleop, the
+    left controller's X button. Deliberately touches ONLY the brick freejoints,
+    never the robot -- safe to press mid-teleop without disturbing calibration
+    or the arm's current pose (if a brick was being carried, it will visibly
+    teleport out of the gripper -- that's the intended "start this pick over"
+    behavior, not a bug)."""
+    for qpos_slice, qvel_slice, qpos0 in brick_reset.values():
+        d.qpos[qpos_slice] = qpos0
+        d.qvel[qvel_slice] = 0.0
+    mujoco.mj_forward(m, d)
+
 
 # Resolved relative to this file (not the caller's cwd) so the script runs
 # from anywhere. The Menagerie clone is expected as a sibling of this repo:
@@ -187,6 +220,14 @@ def main():
     d.ctrl[:] = hold
     mujoco.mj_forward(m, d)
 
+    # Captured once, from the SAME keyframe the bricks were just reset from --
+    # reset_bricks() below replays this rather than re-deriving a "default"
+    # pose, so a mid-run reset always matches stand_at_table exactly.
+    brick_reset = {}
+    for name in PICK_TARGETS:
+        qpos_slice, qvel_slice = _free_joint_slices(m, name)
+        brick_reset[name] = (qpos_slice, qvel_slice, m.key_qpos[key_id][qpos_slice].copy())
+
     seq = None
     tele_source = None
     teleop_ctrl = None
@@ -268,6 +309,7 @@ def main():
     episode_n = 0
     record_state = {"toggle": False, "awaiting_start": False}
     calib_state = {"waiting_printed": False}  # for the 'hold still to calibrate' hint
+    reset_btn_state = {"prev": False}  # edge-detects the VR reset button (see below)
     if args.record_episodes is not None:
         if args.teleop:
             episode_goal = f"teleop ({'hand-tracking' if args.hand_tracking else 'controllers'})"
@@ -288,12 +330,19 @@ def main():
         #        press finalizes+saves it, and so on (xr_teleoperate's convention).
         # 'c' -> drop teleop calibration and re-capture a fresh reference,
         #        so a bad initial capture is recoverable without a restart.
+        # 'r' -> reset the three bricks to their stand_at_table pose (keyboard
+        #        equivalent of the VR left-controller X button below -- lets
+        #        this be exercised with no headset attached, same as every
+        #        other verify_*.py in this repo staying headless-testable).
         if recorder is not None and keycode == ord("S"):
             record_state["toggle"] = True
         if teleop_ctrl is not None and keycode == ord("C"):
             teleop_ctrl.request_recalibration()
             calib_state["waiting_printed"] = False
             print("\nteleop: re-calibrating -- hold both controllers still for a moment")
+        if keycode == ord("R"):
+            reset_bricks(m, d, brick_reset)
+            print("\nbricks reset to stand_at_table pose ('r')")
 
     with mujoco.viewer.launch_passive(m, d, key_callback=key_callback) as viewer:
         if args.view == "egocentric":
@@ -310,6 +359,25 @@ def main():
                 t0 = time.time()
                 if teleop_ctrl is not None:
                     data = tele_source.get_tele_data()
+                    # Left controller X button -> reset brick world positions.
+                    # televuer (like the underlying WebXR/Vuer layer) exposes
+                    # each controller's two face buttons generically as
+                    # "aButton"/"bButton" regardless of handedness -- on a
+                    # Quest 3S's Touch controllers that's physical X/Y on the
+                    # LEFT controller and A/B on the right, the standard
+                    # WebXR gamepad-button convention (button index 4/5).
+                    # UNVERIFIED against a real headset press from this dev
+                    # environment (no hardware reachable here, same caveat as
+                    # the rest of this file's --teleop path) -- if X doesn't
+                    # trigger it on your headset, try left_ctrl_bButton (Y)
+                    # instead. Edge-detected (reset once per press, not once
+                    # per frame held) and independent of calibration state,
+                    # since it never touches the arms.
+                    x_pressed = bool(getattr(data, "left_ctrl_aButton", False))
+                    if x_pressed and not reset_btn_state["prev"]:
+                        reset_bricks(m, d, brick_reset)
+                        print("\nteleop: X button -- bricks reset to stand_at_table pose")
+                    reset_btn_state["prev"] = x_pressed
                     if not teleop_ctrl.calibrated:
                         # Gated: try_calibrate captures the reference only once the
                         # controllers report a stable, non-stale pose for a moment

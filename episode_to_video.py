@@ -11,6 +11,10 @@ Usage:
     python episode_to_video.py recordings/teleop_demo1/episode_0001        # episode dir also OK
     python episode_to_video.py recordings/teleop_demo1                     # task dir -> every episode
     python episode_to_video.py .../episode_0001/colors --fps 20 --output /tmp/ep1.mp4
+    python episode_to_video.py .../episode_0004/colors --start-frame 3152 -o out.mp4
+                                                          # only frames 003152.. onward
+                                                          # (single episode only, same
+                                                          # restriction as --output)
 
 fps is taken from the episode's data.json (info.image.fps) unless --fps overrides it;
 falls back to 30 if neither is available. The on-disk jpgs are already correct-colour
@@ -74,10 +78,18 @@ def _fps_for(episode_dir: pathlib.Path, override: int | None) -> int:
 
 
 def make_video(colors_dir: pathlib.Path, episode_dir: pathlib.Path,
-               fps_override: int | None, out_override: pathlib.Path | None) -> pathlib.Path:
+               fps_override: int | None, out_override: pathlib.Path | None,
+               start_frame: int | None = None, end_frame: int | None = None) -> pathlib.Path:
     frames = sorted(colors_dir.glob(FRAME_GLOB), key=_frame_index)
+    if start_frame is not None or end_frame is not None:
+        # trims by the NNNNNN index baked into each filename, not by position
+        # in the list -- so this is correct even if frames are missing/gapped.
+        frames = [f for f in frames
+                  if (start_frame is None or _frame_index(f) >= start_frame)
+                  and (end_frame is None or _frame_index(f) <= end_frame)]
     if not frames:
-        sys.exit(f"error: no {FRAME_GLOB} frames in {colors_dir}")
+        sys.exit(f"error: no {FRAME_GLOB} frames in {colors_dir} "
+                 f"(after start/end-frame filtering)")
 
     fps = _fps_for(episode_dir, fps_override)
 
@@ -111,14 +123,23 @@ def main():
     ap.add_argument("-o", "--output", type=pathlib.Path, default=None,
                     help="explicit output .mp4 path (single episode only; overrides the "
                          "default <task_dir>/video/<episode>.mp4)")
+    ap.add_argument("--start-frame", type=int, default=None,
+                    help="only include frames with index >= this (the NNNNNN prefix "
+                         "in colors/NNNNNN_<camera>.jpg); default: from the first frame")
+    ap.add_argument("--end-frame", type=int, default=None,
+                    help="only include frames with index <= this; default: to the last frame")
     args = ap.parse_args()
 
     targets = list(_resolve_targets(args.path.resolve()))
     if args.output is not None and len(targets) > 1:
         sys.exit("error: --output can't be used when converting multiple episodes")
+    if (args.start_frame is not None or args.end_frame is not None) and len(targets) > 1:
+        sys.exit("error: --start-frame/--end-frame can't be used when converting "
+                 "multiple episodes")
 
     for colors_dir, episode_dir in targets:
-        make_video(colors_dir, episode_dir, args.fps, args.output)
+        make_video(colors_dir, episode_dir, args.fps, args.output,
+                  args.start_frame, args.end_frame)
 
 
 if __name__ == "__main__":
