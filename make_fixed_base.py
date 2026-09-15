@@ -82,11 +82,32 @@ print(f"keyframe qpos trimmed {len(vals)} -> {len(vals) - 7} (dropped free-joint
 # theta was solved from camera_xpos -> table-top-center at the stand keyframe
 # (see scene_fixed_table.xml); re-derive it if the stance or table position
 # changes. Matches the imu_in_torso site regardless of attribute order.
+# fovy=70: reverted back from a temporary 85 (which had widened it to give the
+# two outermost of the five bricks, brick4/brick5 at y=+/-0.30, more margin --
+# at 70 they sat right at the frame edge). Re-check with a render if the
+# bricks or table move again (same trigger as the tilt derivation above).
+# 3b) inject a stereo PAIR alongside it (fpv_teleop_left/_right), for
+# --stereo-fpv binocular streaming (FpvStreamer/TeleVuerWrapper binocular=True
+# in teleop_control.py). fpv_teleop itself is untouched -- egocentric viewing,
+# EpisodeRecorder, and verify_episode_recording.py all still read the
+# original mono camera; these two are purely additive. Same pos/fovy/xyaxes
+# as fpv_teleop, offset +/-IPD/2 (a typical human IPD ~6.4cm -> 3.2cm each
+# side) along the camera's own RIGHT axis (0 -1 0 in this local frame, see
+# the derivation above) -- i.e. local y -= 0.032 for the right eye, += 0.032
+# for the left eye. Re-derive alongside fpv_teleop if the tilt/stance/table
+# ever change (same trigger).
 SITE_RE = re.compile(r'<site name="imu_in_torso"[^>]*/>')
 site_m = SITE_RE.search(src)
 assert site_m, "imu_in_torso site not found (Menagerie version mismatch?)"
+IPD_HALF = 0.032
 camera_tag = ('\n            <camera name="fpv_teleop" mode="fixed" '
-              'pos="0.08 0 0.45" fovy="70" xyaxes="0 -1 0  0.7558 0 0.6549"/>')
+              'pos="0.08 0 0.45" fovy="70" xyaxes="0 -1 0  0.7558 0 0.6549"/>'
+              f'\n            <camera name="fpv_teleop_left" mode="fixed" '
+              f'pos="0.08 {IPD_HALF} 0.45" fovy="70" '
+              f'xyaxes="0 -1 0  0.7558 0 0.6549"/>'
+              f'\n            <camera name="fpv_teleop_right" mode="fixed" '
+              f'pos="0.08 {-IPD_HALF} 0.45" fovy="70" '
+              f'xyaxes="0 -1 0  0.7558 0 0.6549"/>')
 src = src[:site_m.end()] + camera_tag + src[site_m.end():]
 
 # 4) inject gripper sites, anchored on the wrist_yaw_link collision geom (identically

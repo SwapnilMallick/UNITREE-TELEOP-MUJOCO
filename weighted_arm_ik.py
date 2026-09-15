@@ -272,6 +272,30 @@ class WeightedArmIK:
                 "(pulls in qpsolvers). Or use solver='lm', which needs only "
                 "pinocchio.") from e
         self._mink = mink
+        # BLAS thread oversubscription fix -- found on a real headset run of
+        # the Inspire-hand port (--teleop --teleop-weighted-ik reported motion
+        # "laggy... frame-like discrete", suspected network, was NOT network):
+        # measured via cProfile that virtually all of mink's solve() time goes
+        # into Task.compute_qp_objective's small (nv~80) NumPy matmuls, which
+        # are far too small to benefit from multi-threaded BLAS -- forcing
+        # OPENBLAS_NUM_THREADS=1 dropped solve() from ~75ms to ~0.86ms (~87x),
+        # landing on this module's own documented "~0.7ms/solve" figure. This
+        # module imports the identical mink/NumPy stack and was flagged at the
+        # time as almost certainly carrying the same bug, unconfirmed until
+        # now. Fix: pin BLAS to one thread process-wide right after importing
+        # mink -- a bare (non-context-manager) call, verified to persist for
+        # the rest of the process, which is what's wanted: this control loop's
+        # hot path never has a matrix large enough to want multi-threaded BLAS,
+        # so there's no real work traded away.
+        try:
+            import threadpoolctl
+            threadpoolctl.threadpool_limits(1)
+        except ImportError:                             # pragma: no cover
+            print("[weighted_arm_ik] WARNING: threadpoolctl not installed "
+                  "(`pip install threadpoolctl`) -- mink solves may run "
+                  "~100x slower than expected due to BLAS thread "
+                  "oversubscription on small matrices (see this module's "
+                  "own docstring); teleop motion may look laggy/discrete.")
         # mink.solve_ik() calls configuration.check_limits(safety_break=False)
         # every call, which logs a root-logger WARNING for any joint outside
         # its declared range -- and the stance keyframe's CLOSED Dex3 thumb

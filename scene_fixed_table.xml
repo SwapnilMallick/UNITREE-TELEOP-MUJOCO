@@ -87,7 +87,7 @@
             pos="-0.003125 0 0.00375" density="600" group="3"
             friction="3 0.5 0.3" solref="0.005 1"/>
     </body>
-    <body name="brick3" pos="0.28 0.18 0.768" quat="0.9659258 0 0 0.258819">
+    <body name="brick3" pos="0.28 0.15 0.768" quat="0.9659258 0 0 0.258819">
       <freejoint/>
       <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
             quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
@@ -95,21 +95,66 @@
             pos="-0.003125 0 0.00375" density="600" group="3"
             friction="3 0.5 0.3" solref="0.005 1"/>
     </body>
+
+    <!-- brick4/brick5: two more of the same brick, further out along Y beyond
+         brick1 and brick3 respectively (brick2 already occupies the space
+         between them) -- extra tabletop objects, not assigned to either arm's
+         PICK_TARGETS (see stand_next_to_table.py), so no reach-envelope check
+         was needed the way brick1-3's placement required (CLAUDE.md's "Brick
+         Assets"). Same mesh/collision/friction/solref as brick1-3.
+         brick4 un-yawed like brick1, at y=-0.30: a bounding-box gap of ~3.75cm
+         to brick1 (half-widths 3.125cm each at 10cm centre spacing), matching
+         the ~3cm clearance convention brick1/brick2 already use.
+         (brick1/brick4 were briefly pulled closer to brick2 -- -0.185/-0.27 --
+         then reverted back to these values; -0.20/-0.30 is what's actually
+         verified against verify_arm_ik.py's pick-reach check.)
+         brick5 mirrors brick3's yaw (-30deg instead of +30deg), originally at
+         y=0.33 giving a ~3cm gap to brick3's original y=0.18. brick3 and
+         brick5 were both then pulled 3cm closer to brick2 (0.18->0.15,
+         0.33->0.30) -- shifted by the SAME amount, so the ~3.03cm gap between
+         them is unchanged; only their distance to brick2 shrank (brick3<->
+         brick2: ~12.45cm -> ~9.45cm). Still well clear of the y=0 danger zone
+         documented above for brick2's own placement -- confirmed via a
+         verify_arm_ik.py re-run rather than assumed (brick3 is the left arm's
+         pick target; its known grasp-hold failure, see CLAUDE.md
+         "Fingertip/Brick Contact Tuning", predates and is unrelated to this
+         move). -->
+    <body name="brick4" pos="0.28 -0.30 0.768">
+      <freejoint/>
+      <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
+            quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
+      <geom name="brick4_collision" type="box" size="0.065625 0.03125 0.02875"
+            pos="-0.003125 0 0.00375" density="600" group="3"
+            friction="3 0.5 0.3" solref="0.005 1"/>
+    </body>
+    <body name="brick5" pos="0.28 0.30 0.768" quat="0.9659258 0 0 -0.258819">
+      <freejoint/>
+      <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
+            quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
+      <geom name="brick5_collision" type="box" size="0.065625 0.03125 0.02875"
+            pos="-0.003125 0 0.00375" density="600" group="3"
+            friction="3 0.5 0.3" solref="0.005 1"/>
+    </body>
   </worldbody>
 
   <!-- g1_fixed_upper.xml's own "stand" keyframe is robot-only (43 qpos values,
        g1_with_hands.xml source: 29 body + 14 Dex3-1 finger joints). MuJoCo
-       auto-pads it to this scene's nq=64 with zero/identity for the brick free
-       joints, which resets every brick to the world origin -- not the table.
-       This keyframe gives the full scene (robot + 3 bricks) a correct reset
-       point; stand_next_to_table.py looks it up by name instead of index 0.
-       Robot qpos/ctrl values copied verbatim from g1_fixed_upper.xml's "stand". -->
+       auto-pads it to this scene's nq (78, with all five bricks) with
+       zero/identity for the brick free joints, which resets every brick to
+       the world origin -- not the table. This keyframe gives the full scene
+       (robot + 5 bricks) a correct reset point; stand_next_to_table.py looks
+       it up by name instead of index 0. Robot qpos/ctrl values copied
+       verbatim from g1_fixed_upper.xml's "stand". qpos length must always
+       equal nq (see CLAUDE.md's "Generation Pipeline & Hard Invariants") --
+       this grew from 64 to 78 with brick4/brick5's addition. -->
   <keyframe>
     <key name="stand_at_table"
       qpos="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.2 0.2 0 1.28 0 0 0 0 1.05 0 0 0 0 0 0.2 -0.2 0 1.28 0 0 0 0 -1.05 0 0 0 0 0
             0.28 -0.20 0.768 1 0 0 0
             0.28 -0.07 0.768 0.7071068 0 0 0.7071068
-            0.28 0.18 0.768 0.9659258 0 0 0.258819"
+            0.28 0.15 0.768 0.9659258 0 0 0.258819
+            0.28 -0.30 0.768 1 0 0 0
+            0.28 0.30 0.768 0.9659258 0 0 -0.258819"
       ctrl="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.2 0.2 0 1.28 0 0 0 0 1.05 0 0 0 0 0 0.2 -0.2 0 1.28 0 0 0 0 -1.05 0 0 0 0 0"/>
   </keyframe>
 </mujoco>

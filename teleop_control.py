@@ -685,14 +685,14 @@ class TeleopController:
 
 
 class FpvStreamer:
-    """Offscreen-renders one camera and pushes frames to a televuer-like sink
-    every step() call, rate-limited to roughly `fps` real-time rather than
-    every physics step -- offscreen rendering is comparatively expensive
-    (unlike the pure-ctrl-array work everything else here does), and the
-    headset doesn't need physics-rate frames. See module docstring for why
-    no client-side code is needed for this at all.
+    """Offscreen-renders the FPV camera(s) and pushes frames to a
+    televuer-like sink every step() call, rate-limited to roughly `fps`
+    real-time rather than every physics step -- offscreen rendering is
+    comparatively expensive (unlike the pure-ctrl-array work everything else
+    here does), and the headset doesn't need physics-rate frames. See module
+    docstring for why no client-side code is needed for this at all.
 
-    Usage:
+    Usage (mono, unchanged):
         streamer = FpvStreamer(m, "fpv_teleop")
         ...
         while running:
@@ -700,26 +700,36 @@ class FpvStreamer:
                                              # rate-limited, most calls no-op
             mujoco.mj_step(m, d)
 
+    Usage (stereo -- pairs with TeleVuerWrapper(binocular=True)):
+        streamer = FpvStreamer(m, "fpv_teleop", stereo=True)
+        # renders "fpv_teleop_left"/"fpv_teleop_right" (make_fixed_base.py's
+        # stereo pair alongside the original mono "fpv_teleop" camera) and
+        # sends one side-by-side (left|right) frame per step -- matches
+        # televuer's own documented binocular layout (a single combined-width
+        # image, split down the middle internally), confirmed by reading
+        # televuer's source directly rather than guessing. img_shape passed
+        # to TeleVuerWrapper must then be (height, 2*width), not (height, width).
+
     `sink` (tele_source above) only needs a `.render_to_xr(image)` method --
     a real televuer.TeleVuerWrapper works, and so does any stub with that
     one method, matching TeleopController's tele_data duck-typing.
     """
 
-    def __init__(self, m, camera_name, height=480, width=640, fps=30):
+    def __init__(self, m, camera_name, height=480, width=640, fps=30, stereo=False):
         self.renderer = mujoco.Renderer(m, height=height, width=width)
-        self.camera_name = camera_name
+        self.stereo = stereo
+        if stereo:
+            self.left_camera = f"{camera_name}_left"
+            self.right_camera = f"{camera_name}_right"
+        else:
+            self.camera_name = camera_name
         # mirrors verify_stack_sequence.py --record's own frame_every pattern:
         # sample every Nth physics step to approximate fps in real time
         self.frame_every = max(int(round((1.0 / fps) / m.opt.timestep)), 1)
         self._step_count = 0
 
-    def step(self, d, sink):
-        """Call once per control step. Returns True on steps a frame was
-        actually rendered and sent (most calls no-op, by design)."""
-        self._step_count += 1
-        if self._step_count % self.frame_every != 0:
-            return False
-        self.renderer.update_scene(d, camera=self.camera_name)
+    def _render_bgr(self, d, camera_name):
+        self.renderer.update_scene(d, camera=camera_name)
         frame = self.renderer.render()
         # televuer's own render loop applies cv2.cvtColor(BGR2RGB) to whatever
         # we hand it (it assumes an OpenCV-style BGR source) -- MuJoCo's
@@ -727,7 +737,22 @@ class FpvStreamer:
         # conversion undoes it and the final displayed color is correct.
         # Confirmed on real hardware: without this, a wood-brown table showed
         # up blue in the headset (R/B channels swapped).
-        sink.render_to_xr(frame[..., ::-1])
+        return frame[..., ::-1]
+
+    def step(self, d, sink):
+        """Call once per control step. Returns True on steps a frame was
+        actually rendered and sent (most calls no-op, by design)."""
+        self._step_count += 1
+        if self._step_count % self.frame_every != 0:
+            return False
+        if self.stereo:
+            left = self._render_bgr(d, self.left_camera)
+            right = self._render_bgr(d, self.right_camera)
+            # side-by-side, left half then right half -- matches televuer's
+            # own binocular split (img_width = img_shape[1] // 2 per eye).
+            sink.render_to_xr(np.hstack([left, right]))
+        else:
+            sink.render_to_xr(self._render_bgr(d, self.camera_name))
         return True
 
 

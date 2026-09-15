@@ -49,12 +49,21 @@ SCENE = MODEL_DIR / "scene_fixed_table.xml"
 # overlap at rest); with that fix the right arm reaches it cleanly (1.6cm,
 # matching brick1/brick3's margin) while the left arm now clearly can't
 # (10.5cm) -- so the assignment is: right arm takes both brick1 and brick2,
-# left arm takes brick3. That's why only three cases are tested below instead
-# of the four originally used to make this call.
+# left arm takes brick3.
+#
+# brick4 (y=-0.30) and brick5 (y=0.30) are further off-center than brick1/
+# brick3 respectively, on the SAME side each -- unlike brick2, there's no
+# dead-center ambiguity here, so (matching how brick1/brick3 themselves were
+# tested) each gets only its natural-side arm rather than a both-arms check.
+# Still run through the SAME real-simulated-drive test as every other brick,
+# not just an IK-only solve -- per this module's own docstring, IK
+# convergence alone doesn't rule out a self-collision along the approach.
 CASES = [
-    ("right", "right_gripper_site", RIGHT_ARM, "brick1"),  # brick1 y=-0.15
+    ("right", "right_gripper_site", RIGHT_ARM, "brick1"),  # brick1 y=-0.20
     ("right", "right_gripper_site", RIGHT_ARM, "brick2"),  # brick2 y=-0.07 (moved off-center)
-    ("left",  "left_gripper_site",  LEFT_ARM,  "brick3"),  # brick3 y=+0.18
+    ("left",  "left_gripper_site",  LEFT_ARM,  "brick3"),  # brick3 y=+0.15
+    ("right", "right_gripper_site", RIGHT_ARM, "brick4"),  # brick4 y=-0.30
+    ("left",  "left_gripper_site",  LEFT_ARM,  "brick5"),  # brick5 y=+0.30
 ]
 
 # A pre-grasp point above the brick, not its exact resting center -- the brick

@@ -11,3 +11,13 @@ CLAUDE.md
 commands
 json_data
 .DS_Store
+
+/inspire_hand/meshes
+/inspire_hand/recordings
+/inspire_hand/*.png
+/inspire_hand/*.mp4
+/inspire_hand/*.json
+/inspire_hand/*.txt
+/*.png
+/*.txt
+/inspire_hand

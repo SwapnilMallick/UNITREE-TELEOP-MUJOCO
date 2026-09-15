@@ -42,8 +42,9 @@ since no headset is reachable from this dev environment).
 
 Viewer keys: 's' toggles episode recording, 'c' re-runs teleop calibration,
 'r' resets the three bricks to their stand_at_table pose. In --teleop, the
-left controller's X button does the same brick reset as 'r' (UNVERIFIED
-against a real headset -- see the comment at its wiring in main()).
+left controller's X button does the same brick reset as 'r', and the right
+controller's A button does the same recalibration as 'c' (both UNVERIFIED
+against a real headset -- see the comments at their wiring in main()).
 """
 import argparse, time, pathlib, os
 import numpy as np
@@ -54,16 +55,38 @@ from pick_sequence import PickSequence
 from teleop_control import TeleopController, FpvStreamer, HandRetargeter
 from episode_recording import EpisodeRecorder
 
-# Only brick1/brick2 (right arm) are verified reliable -- see
-# verify_grasp_hold.py and CLAUDE.md's "Fingertip/Brick Contact Tuning".
-# brick3 (left arm) is a documented, unresolved grasp-approach-geometry
-# problem; included here so --pick brick3 is possible for testing, not
-# because it's expected to succeed.
+# brick1/brick2 (right arm) and brick3 (left arm) all pass verify_arm_ik.py's
+# reach+real-simulated-drive check, but NONE currently pass verify_grasp_hold.py
+# -- a pre-existing regression from the brick-enlargement work (scale 0.015 ->
+# 0.025) that predates brick4/brick5 and isn't fixed here: brick1 doesn't even
+# lift off the table, brick2 lifts partway and doesn't hold, and brick3 has
+# its own separate, older grasp-approach-geometry problem (the left wrist
+# collides with it). --pick still works for all of them, just don't expect a
+# held grasp until the fingertip/contact tuning is redone for the new size.
+#
+# brick4 (right arm) and brick5 (left arm) were added the same way brick1-3
+# originally were: paired with the arm on their own side (right reaches -Y,
+# left reaches +Y -- see verify_arm_ik.py's CASES comment), then verified via
+# verify_arm_ik.py's reach+drive check (both PASS, ~1.8cm error, no pelvis
+# drift/NaN) AND a direct d.contact check confirming the approach never
+# touches the adjacent brick (brick4<->brick1, brick5<->brick3) or anything
+# else beyond each brick's own normal resting contact with the table. Same
+# caveat as brick1-3 above applies: reach is verified, grasp-hold is not.
 PICK_TARGETS = {
     "brick1": ("right", "right_gripper_site", RIGHT_ARM, RIGHT_HAND, "brick1"),
     "brick2": ("right", "right_gripper_site", RIGHT_ARM, RIGHT_HAND, "brick2"),
     "brick3": ("left",  "left_gripper_site",  LEFT_ARM,  LEFT_HAND,  "brick3"),
+    "brick4": ("right", "right_gripper_site", RIGHT_ARM, RIGHT_HAND, "brick4"),
+    "brick5": ("left",  "left_gripper_site",  LEFT_ARM,  LEFT_HAND,  "brick5"),
 }
+
+# Every brick on the table. Now that brick4/brick5 are also in PICK_TARGETS
+# this happens to equal its keys, but kept as its own name (derived, not
+# duplicated) so reset_bricks()/EpisodeRecorder's ground truth keep covering
+# "every brick on the table" rather than "every pick-assigned brick" even if
+# a future brick is ever added as decoration only, the way brick4/5 briefly
+# were.
+ALL_BRICK_NAMES = tuple(PICK_TARGETS)
 
 def _free_joint_slices(m, body_name):
     """qpos (7: xyz + wxyz quat) and qvel (6: linear + angular) slices for a
@@ -138,6 +161,15 @@ def parse_args():
                               "window with the real world around it; 'immersive' replaces the "
                               "view entirely with fpv_teleop. Both stream over televuer's zmq "
                               "transport, enabled automatically when set.")
+    parser.add_argument("--stereo-fpv", action="store_true",
+                         help="with --teleop and --display-mode ego/immersive, stream a real "
+                              "binocular (stereo) view instead of one mono frame shown to both "
+                              "eyes -- gives actual depth/parallax rather than a flat 2-D image "
+                              "filling the headset. Renders the fpv_teleop_left/fpv_teleop_right "
+                              "camera pair (make_fixed_base.py) and sends a side-by-side frame "
+                              "via TeleVuerWrapper(binocular=True). Off by default (mono, "
+                              "unchanged prior behavior); ignored with --display-mode "
+                              "pass-through.")
     parser.add_argument("--hand-tracking", action="store_true",
                          help="with --teleop, use real per-finger hand-tracking (via "
                               "televuer's use_hand_tracking=True + dex_retargeting) instead "
@@ -224,7 +256,7 @@ def main():
     # reset_bricks() below replays this rather than re-deriving a "default"
     # pose, so a mid-run reset always matches stand_at_table exactly.
     brick_reset = {}
-    for name in PICK_TARGETS:
+    for name in ALL_BRICK_NAMES:
         qpos_slice, qvel_slice = _free_joint_slices(m, name)
         brick_reset[name] = (qpos_slice, qvel_slice, m.key_qpos[key_id][qpos_slice].copy())
 
@@ -246,16 +278,23 @@ def main():
         # headset's own cameras, no streaming. --display-mode ego/immersive streams
         # the fpv_teleop camera instead -- see FpvStreamer in teleop_control.py;
         # televuer requires zmq (or webrtc) enabled for either of those modes.
+        # --stereo-fpv: FpvStreamer renders fpv_teleop_left/_right and sends one
+        # side-by-side (left|right) frame; televuer's own source (read directly,
+        # not guessed) splits img_shape's width in HALF internally per eye when
+        # binocular=True, so img_shape's width must be doubled to 2*640 here --
+        # NOT the same (height, 640) used for the mono case below.
+        img_shape = (480, 1280) if args.stereo_fpv else (480, 640)
         tele_source = TeleVuerWrapper(
             use_hand_tracking=args.hand_tracking,  # controllers by default, matching
                                                      # the locked-in teleop design decision
-            binocular=False,  # FpvStreamer renders one mono frame per camera, not a
-                               # side-by-side stereo pair
-            img_shape=(480, 640),  # (height, width) -- must match FpvStreamer's actual
-                                    # rendered frame size exactly; televuer's img2display
-                                    # buffer is sized from THIS, independent of binocular
-                                    # (binocular=False alone did NOT fix the shape mismatch --
-                                    # confirmed empirically, this is the real knob)
+            binocular=args.stereo_fpv,  # False (default): FpvStreamer renders one mono
+                                         # frame per camera. True: a real side-by-side
+                                         # stereo pair -- see --stereo-fpv above.
+            img_shape=img_shape,  # (height, width) -- must match FpvStreamer's actual
+                                   # rendered frame size exactly; televuer's img2display
+                                   # buffer is sized from THIS, independent of binocular
+                                   # (binocular=False alone did NOT fix the shape mismatch --
+                                   # confirmed empirically, this is the real knob)
             display_mode=args.display_mode,
             zmq=(args.display_mode != "pass-through"),
             cert_file=str(args.cert_file) if args.cert_file else None,
@@ -291,7 +330,7 @@ def main():
                 "  solver 'ipopt' -> pip install casadi\n"
                 f"({e})"
             ) from e
-        fpv_streamer = (FpvStreamer(m, EGOCENTRIC_CAMERA)
+        fpv_streamer = (FpvStreamer(m, EGOCENTRIC_CAMERA, stereo=args.stereo_fpv)
                          if args.display_mode != "pass-through" else None)
         print(f"teleop: waiting for headset connection + first "
               f"{'hand-tracking' if args.hand_tracking else 'controller'} data...")
@@ -310,6 +349,7 @@ def main():
     record_state = {"toggle": False, "awaiting_start": False}
     calib_state = {"waiting_printed": False}  # for the 'hold still to calibrate' hint
     reset_btn_state = {"prev": False}  # edge-detects the VR reset button (see below)
+    recalib_btn_state = {"prev": False}  # edge-detects the VR recalibrate button (see below)
     if args.record_episodes is not None:
         if args.teleop:
             episode_goal = f"teleop ({'hand-tracking' if args.hand_tracking else 'controllers'})"
@@ -319,7 +359,7 @@ def main():
             episode_goal = "hold stance"
         recorder = EpisodeRecorder(m, task_dir=str(args.record_episodes),
                                     goal=episode_goal,
-                                    extra_bodies=list(PICK_TARGETS))  # brick1/2/3 ground truth
+                                    extra_bodies=list(ALL_BRICK_NAMES))  # every brick's ground truth
         print(f"episode recording armed -- press 's' in the viewer window to start an "
               f"episode into {args.record_episodes}/, 's' again to stop and save it "
               f"(repeat for more takes). Nothing records until the first 's'.")
@@ -378,6 +418,22 @@ def main():
                         reset_bricks(m, d, brick_reset)
                         print("\nteleop: X button -- bricks reset to stand_at_table pose")
                     reset_btn_state["prev"] = x_pressed
+                    # Right controller A button -> recalibrate (VR equivalent of
+                    # the 'c' key). Same aButton/bButton caveat as the left
+                    # controller's reset button above: "aButton" is the generic
+                    # WebXR/Vuer name for the controller's primary face button,
+                    # which on a Quest 3S's right Touch controller is physical A
+                    # (left controller's is X). UNVERIFIED against a real headset
+                    # press -- try right_ctrl_bButton (B) if A doesn't fire it.
+                    # Edge-detected and safe to press whether or not the arm is
+                    # currently calibrated (request_recalibration() is idempotent).
+                    a_pressed = bool(getattr(data, "right_ctrl_aButton", False))
+                    if a_pressed and not recalib_btn_state["prev"]:
+                        teleop_ctrl.request_recalibration()
+                        calib_state["waiting_printed"] = False
+                        print("\nteleop: A button -- re-calibrating, hold both "
+                              "controllers still for a moment")
+                    recalib_btn_state["prev"] = a_pressed
                     if not teleop_ctrl.calibrated:
                         # Gated: try_calibrate captures the reference only once the
                         # controllers report a stable, non-stale pose for a moment
