@@ -142,6 +142,19 @@ solver="ipopt" -- the same weighted cost as solver="lm" but solved as a
 import numpy as np
 import mujoco
 
+# Post-solve weighted moving-average filter on the mink solver's SOLVED JOINT
+# OUTPUT (newest solve weighted highest). Ported from xr_teleoperate's own
+# robot_arm_ik.py (unitreerobotics/xr_teleoperate, teleop/robot_control/) --
+# confirmed by reading their actual CasADi/IPOPT IK source that even though it
+# solves a completely different optimization (NLP vs mink's QP) and has NO
+# explicit self-collision avoidance either, real-headset G1+Dex3-1 teleop
+# there tracks smoothly (2026-09-15/16 findings). Part of why: a genuinely
+# missing layer here -- we had EMA smoothing on the raw VR *input* and
+# rate-limiting on the IK *target*, but nothing smoothing the *solved joint
+# output* itself. This weighted-average window is that missing layer, applied
+# independently of (and on top of) both of those.
+MINK_OUTPUT_FILTER_WEIGHTS = np.array([0.4, 0.3, 0.2, 0.1])  # newest -> oldest
+
 _ARM_JOINTS = {
     "left":  ["left_shoulder_pitch_joint", "left_shoulder_roll_joint",
               "left_shoulder_yaw_joint", "left_elbow_joint",
@@ -228,6 +241,14 @@ class WeightedArmIK:
         self._call_i = 0
         # used by solve() regardless of solver
         self._solve_blend = float(solve_blend)
+        # post-solve weighted moving-average filter on the SOLVED JOINT OUTPUT
+        # (mink path only) -- see MINK_OUTPUT_FILTER_WEIGHTS' own comment for why
+        # this is a real, separate layer from the input-side EMA/rate-limiting
+        # already in teleop_control.py. Initialized to the stance reference,
+        # repeated -- self-corrects within a few 2ms physics steps of real
+        # operation regardless, so a stale initial history isn't a real concern
+        # and doesn't need an explicit reset on calibration/recalibration.
+        self._q_output_history = [q_arm_ref.copy() for _ in range(len(MINK_OUTPUT_FILTER_WEIGHTS))]
 
         if solver == "mink":
             self._init_mink(model, site_name, joint_slice, q_stance_full,
@@ -324,6 +345,59 @@ class WeightedArmIK:
         cost[joint_slice] = posture_cost_arm
         self._mink_posture = mink.PostureTask(model, cost=cost, lm_damping=lm_damping)
         self._mink_limits = [mink.ConfigurationLimit(model)]
+        # Self-collision avoidance for THIS arm's own links, plus this arm against
+        # the torso. Found necessary empirically (2026-09-15, real-headset report:
+        # "joints entangled"), not added speculatively: ConfigurationLimit above only
+        # enforces per-joint RANGE limits, so for a large deliberate reorientation
+        # (~120 degrees, a realistic reach+twist) mink could happily solve for a joint
+        # configuration where every joint is individually in range but
+        # right_wrist_roll_link and right_wrist_yaw_link physically overlap (measured:
+        # self-colliding for ~85% of a 6s motion, right_wrist_yaw_joint pushed PAST
+        # its own declared range by the resulting fight against the kp=500 position
+        # actuators, peak joint velocities up to 24 rad/s) -- a genuine kinematic
+        # reachability problem, not a glitch/instability artifact (a separate,
+        # already-fixed issue -- see TARGET_MAX_ANGULAR_SPEED in teleop_control.py).
+        # A second, smaller collision (right_shoulder_yaw_link <-> torso_link) showed
+        # up in the same test.
+        #
+        # SCOPED, not a blanket whole-arm self-cross: checked pairwise geom distances
+        # at rest (stand_at_table) first, not assumed safe -- several non-adjacent
+        # pairs sit naturally close even in the ordinary stance pose (elbow_link
+        # touches torso_link at distance 0.0 with the arm hanging at the side,
+        # elbow_link/wrist_pitch_link sit 9.5mm apart, shoulder_roll_link/torso_link
+        # 1.8cm) -- a blanket all-pairs self-collision limit tried first made the QP
+        # INFEASIBLE (mink.solve_ik's `assert dq is not None` fired ~0.4s in, during
+        # the ordinary ramp from stance to TELEOP_HOME, nothing exotic) because those
+        # already-near/touching-at-rest pairs got a near-zero-slack constraint from
+        # the very first solve. Scoped instead to just the two pairs the real
+        # entanglement measurement actually found colliding during the problem
+        # motion: {side}_wrist_roll_link<->{side}_wrist_yaw_link (skips over
+        # wrist_pitch_link in between, so NOT excluded by mink's own
+        # parent-child/weld check) and {side}_shoulder_yaw_link<->torso_link.
+        def _body_geoms(name):
+            bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+            return [g for g in range(model.ngeom) if model.geom_bodyid[g] == bid] if bid >= 0 else []
+
+        wrist_roll_geoms = _body_geoms(f"{self._side}_wrist_roll_link")
+        wrist_yaw_geoms = _body_geoms(f"{self._side}_wrist_yaw_link")
+        shoulder_yaw_geoms = _body_geoms(f"{self._side}_shoulder_yaw_link")
+        torso_geoms = _body_geoms("torso_link")
+        collision_pairs = []
+        if wrist_roll_geoms and wrist_yaw_geoms:
+            collision_pairs.append((wrist_roll_geoms, wrist_yaw_geoms))
+        if shoulder_yaw_geoms and torso_geoms:
+            collision_pairs.append((shoulder_yaw_geoms, torso_geoms))
+        if collision_pairs:
+            # bound_relaxation gives the QP a little slack rather than a hard
+            # zero-closing-velocity wall the instant a pair is already inside
+            # minimum_distance_from_collisions (true for wrist_roll<->wrist_yaw even
+            # at rest, ~1cm apart) -- found necessary empirically: 0.0 (mink's
+            # default) still hit the same infeasible-QP assertion on this scoped
+            # pair list; 0.02 (2cm/s of allowed closing rate) resolved it while still
+            # measurably reducing the self-collision/limit-violation seen during the
+            # large reorientation that motivated this fix in the first place.
+            self._mink_limits.append(mink.CollisionAvoidanceLimit(
+                model, geom_pairs=collision_pairs, bound_relaxation=0.01))
         self._mink_qp_damping = float(qp_damping)
         self._mink_qp_solver = qp_solver
         # mink.solve_ik's dt controls how far one QP solution is integrated;
@@ -347,11 +421,46 @@ class WeightedArmIK:
             rot = mink.SO3.identity()
         se3 = mink.SE3.from_rotation_and_translation(rot, np.asarray(target_pos, float))
         self._mink_task.set_target(se3)
-        vel = mink.solve_ik(self._mink_config, [self._mink_task, self._mink_posture],
-                            self._mink_dt, self._mink_qp_solver,
-                            damping=self._mink_qp_damping, limits=self._mink_limits)
+        try:
+            vel = mink.solve_ik(self._mink_config, [self._mink_task, self._mink_posture],
+                                self._mink_dt, self._mink_qp_solver,
+                                damping=self._mink_qp_damping, limits=self._mink_limits)
+        except AssertionError:
+            # mink.solve_ik's own `assert dq is not None` fires when the QP backend
+            # (quadprog) finds the combined task/posture/joint-limit/collision-
+            # avoidance constraints infeasible for ANY joint velocity -- confirmed
+            # this is a real, reachable case, not a hypothetical: even after tuning
+            # the collision-avoidance limit's own bound_relaxation to avoid it for
+            # the specific large-reorientation scenario that motivated adding that
+            # limit, the margin between "infeasible" and "constraint has no
+            # measurable effect" was razor-thin, and a live control loop fed
+            # unpredictable real headset input cannot rely on having found every
+            # such case in advance. A hard crash here would kill the whole teleop
+            # loop (and, on a real headset, freeze the operator's view with no
+            # recovery short of a process restart) -- far worse than one frame of
+            # no motion. Hold the previous joint config instead, matching this
+            # codebase's existing DIVERGENCE_RESID "hold position, don't flail"
+            # convention (TeleopController.step()) for exactly this class of
+            # "the solver isn't giving something usable right now" situation.
+            if self._debug:
+                print(f"[weighted_arm_ik] mink QP infeasible this step "
+                      f"({self.site_name}) -- holding previous joint config")
+            q_raw = self._mink_config.q[self.joint_slice].copy()
+            return self._filter_mink_output(q_raw)
         self._mink_config.integrate_inplace(vel, self._mink_dt)
-        return self._mink_config.q[self.joint_slice].copy()
+        q_raw = self._mink_config.q[self.joint_slice].copy()
+        return self._filter_mink_output(q_raw)
+
+    def _filter_mink_output(self, q_raw):
+        """Weighted moving average over the last few mink solves -- see
+        MINK_OUTPUT_FILTER_WEIGHTS' own module-level comment. Called on every
+        mink solve, including the infeasible-QP fallback above, so the
+        history stays a consistent per-frame record rather than skipping
+        frames the fallback handled."""
+        self._q_output_history.pop(0)
+        self._q_output_history.append(q_raw)
+        stacked = np.stack(self._q_output_history[::-1])  # newest first
+        return MINK_OUTPUT_FILTER_WEIGHTS @ stacked
 
     # ============================================================= pinocchio
     def _init_pinocchio(self, model, site_name, joint_slice, arm_joint_names,

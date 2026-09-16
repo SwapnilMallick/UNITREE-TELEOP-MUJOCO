@@ -212,12 +212,25 @@ TELEOP_ORI_WEIGHT = 0.4      # --teleop-orientation (EXPERIMENTAL) only, with th
                               # gripper rotation depending on axis, and position degrades
                               # 10-25cm. No weight tested fixes it. This weight is just
                               # "least bad". The real fix is --teleop-weighted-ik below.
-TELEOP_WEIGHTED_ORI_WEIGHT = 1.0  # --teleop-orientation with --teleop-weighted-ik
-                              # (weighted_arm_ik.WeightedArmIK). That solver keeps position a
-                              # high-weight term (pos_weight >> ori_weight internally), so an
-                              # infeasible orientation request can't trade position away --
-                              # 1.0 here is a straightforward orientation weight, not a
-                              # damped-down "least bad" one.
+TELEOP_WEIGHTED_ORI_WEIGHT = 0.1  # --teleop-orientation with --teleop-weighted-ik
+                              # (weighted_arm_ik.WeightedArmIK). Was 1.0 (matching
+                              # mink_pos_cost=1.0 1:1) until 2026-09-16 -- lowered after a
+                              # real-usage report of joints "sometimes getting entangled"
+                              # traced to real, MEASURED wrist self-collision under large
+                              # reorientations (see CLAUDE.md "Teleop Input (Phase 2)"),
+                              # informed by reading xr_teleoperate's own (actually smooth on
+                              # real G1+Dex3-1) robot_arm_ik.py: it weights position ~50-100x
+                              # over orientation, i.e. far more willing to let orientation
+                              # tracking slip than fight hard for exact rotation. Swept 1.0 ->
+                              # 0.3 -> 0.15 -> 0.1 -> 0.08 -> 0.04 against a large (~120deg)
+                              # reorientation test; 0.1 gave the best combination of reduced
+                              # self-collision (~2660 -> ~2000 contact-steps of ~3250 in the
+                              # test) and healthy wrist joint-limit margins, while leaving the
+                              # already-validated 45deg-rotation numbers UNCHANGED (45.1/47.4/
+                              # 45.1deg vs the old 45.5/43.2/45.3deg -- within noise, not a
+                              # real regression). Does NOT eliminate self-collision for this
+                              # extreme case, only reduces it -- see CLAUDE.md for the honest
+                              # numbers, this is a mitigation, not a guarantee.
 VR_FILTER_ALPHA = 0.2        # EMA weight on the new (accepted) controller pose each frame
 VR_GLITCH_TOL = 0.10         # m; a single-frame controller jump larger than this is a
                               # tracking dropout/reacquire, not a hand -- rejected, hold last
@@ -226,6 +239,23 @@ VR_GLITCH_HOLD_TIME = 0.4    # s; if the rejected pose persists this long it's a
 TARGET_MAX_SPEED = 2.0       # m/s; cap on IK-target translation speed. A burst of accepted
                               # motion (or a filter re-seat) then ramps in over ~0.1-0.2s
                               # instead of hitting the actuators as a step
+TARGET_MAX_ANGULAR_SPEED = 2.0 * np.pi  # rad/s (~360 deg/s); the ORIENTATION analogue of
+                              # TARGET_MAX_SPEED above -- ported from the Inspire-hand port's
+                              # own fix for a real-headset report ("arms sometimes move wildly
+                              # even with smaller movements"). POSITION has always been
+                              # rate-limited here; ORIENTATION was not -- target_quat was
+                              # recomputed fresh from the filtered VR quat every call and
+                              # handed straight to ik.solve(), so a momentarily glitchy
+                              # orientation reading (tracking noise, an IMU blip, or a real
+                              # fast involuntary wrist twitch) that looked like a normal
+                              # POSITION move (so _filter_vr's position-only glitch gate let
+                              # it through) still produced a large one-step joint swing --
+                              # this is what self-collision/entanglement between the wrist
+                              # links traced back to (see CLAUDE.md's "Teleop Input" section).
+                              # Generous for real fast intentional wrist rotation (~15x the
+                              # ~0.4 rad/s a 45-degree-over-2s test elsewhere in this repo
+                              # ramps at) while still forcing a worst-case ~180-degree
+                              # glitch/flip to ramp in over >=0.5s instead of landing in one step.
 DIVERGENCE_RESID = 0.15      # m; post-solve site-to-target error above this, sustained,
                               # means the arm has destabilised -- warn once, suggest 'c'
 
@@ -273,6 +303,29 @@ def _apply_relative_quat(q_rel, q_base):
     """Apply a world-frame rotation delta on top of a base orientation."""
     q_out = np.zeros(4)
     mujoco.mju_mulQuat(q_out, q_rel, q_base)
+    return q_out
+
+
+def _rate_limit_quat(q_target, q_prev, max_angle_step):
+    """Clamp q_target to at most max_angle_step (radians) of rotation away
+    from q_prev, the ORIENTATION analogue of step()'s own position rate
+    limiter (max_target_step). Returns the (possibly clamped) new quat.
+
+    Handles quaternion double-cover explicitly (q and -q represent the same
+    rotation) via a dot-product sign check -- the same convention
+    `_filter_vr`'s own EMA already uses -- so a legitimate near-zero
+    rotation is never mistaken for a near-180-degree one just because the
+    upstream conversion happened to flip sign between calls."""
+    q_prev = q_prev.copy()
+    if float(np.dot(q_prev, q_target)) < 0.0:
+        q_prev = -q_prev
+    dq = np.zeros(3)
+    mujoco.mju_subQuat(dq, q_target, q_prev)
+    angle = float(np.linalg.norm(dq))
+    if angle <= max_angle_step or angle < 1e-9:
+        return q_target.copy()
+    q_out = q_prev.copy()
+    mujoco.mju_quatIntegrate(q_out, dq * (max_angle_step / angle), 1.0)
     return q_out
 
 
@@ -402,8 +455,21 @@ class TeleopController:
         self._vr_quat_filt = {}    # EMA-smoothed controller quat actually used
         self._glitch_frames = {}   # consecutive rejected-as-glitch frames, per side
         self._target_pos_prev = {} # last commanded IK target, for the rate limit
+        self._target_quat_prev = {} # last commanded orientation target, for _rate_limit_quat
         self._diverge_frames = {}  # consecutive frames with a large post-solve residual
         self._diverge_warned = {}  # one-shot flag for the "holding position" message
+        self._drop_count = {"left": 0, "right": 0}  # frames rejected by _filter_vr as a
+                                                      # glitch, accumulated over the current
+                                                      # ~1s window -- see the periodic print
+                                                      # below; diagnoses whether the real
+                                                      # headset's controller-pose update rate
+                                                      # is lower than this loop's physics rate
+                                                      # (500Hz) by enough that genuine smooth
+                                                      # motion gets mistaken for tracking
+                                                      # dropouts (VR_GLITCH_TOL), which would
+                                                      # look exactly like "laggy/discrete" arm
+                                                      # motion despite the IK solver itself
+                                                      # tracking its target correctly
         self.calibrated = False
         self.calib_warning = None   # set by calibrate() if the captured pose looks lopsided
         self.last_grip = {"left": 0.0, "right": 0.0}
@@ -501,6 +567,7 @@ class TeleopController:
             self._vr_quat_filt[side] = vr_quat.copy()
             self._glitch_frames[side] = 0
             self._target_pos_prev[side] = here.copy()  # rate-limit ramps here -> HOME
+            self._target_quat_prev[side] = _site_quat(ik)  # rate-limit ramps here -> HOME too
             self._diverge_frames[side] = 0
             self._diverge_warned[side] = False
             if self._debug:
@@ -573,6 +640,7 @@ class TeleopController:
         self._step_i += 1
         verbose = self._debug and (self._step_i % self._steps_per_sec == 0)
         max_target_step = TARGET_MAX_SPEED * self._dt
+        max_target_angle_step = TARGET_MAX_ANGULAR_SPEED * self._dt
         for side, _, arm_slice, _ in _SIDES:
             ik = self._iks[side]
             ik.sync(d.qpos)  # re-seed from the live sim every frame -- the arm
@@ -581,6 +649,8 @@ class TeleopController:
 
             vr_pos_raw, vr_quat_raw = _se3_to_pos_quat(getattr(tele_data, f"{side}_wrist_pose"))
             vr_pos, vr_quat, dropped = self._filter_vr(side, vr_pos_raw, vr_quat_raw)
+            if dropped:
+                self._drop_count[side] += 1
 
             pos_delta = scale * (vr_pos - self._vr_ref_pos[side])
             delta_norm = float(np.linalg.norm(pos_delta))
@@ -592,10 +662,23 @@ class TeleopController:
             # workspace clamp: pull the target onto the REACH_RADIUS sphere around
             # the shoulder, so a big controller excursion pins at the nearest
             # REACHABLE point instead of diverging (the table/brick targets sit
-            # ~0.40m from the shoulder, inside; a raised-arm lunge sits outside)
+            # ~0.40m from the shoulder, inside; a raised-arm lunge sits outside).
+            # --teleop-weighted-ik (mink) ONLY: skipped -- mink.ConfigurationLimit
+            # already enforces the arm's real joint limits as a hard QP constraint,
+            # more accurately than this sphere approximates them (found 2026-09-17:
+            # a continuous downward controller motion stalled well above the table
+            # because REACH_RADIUS's uniform sphere is tighter than the arm's real
+            # reach in that specific direction, even though the table itself was
+            # comfortably within the true kinematic limit). MAX_TARGET_DELTA above
+            # still applies regardless of solver -- that one guards against
+            # corrupted/stale input (a tracking dropout, a bad calibration
+            # reference), not reachability, and mink's joint limits don't protect
+            # against a nonsensical target driving it into an extreme, possibly
+            # self-colliding configuration the way this repo's own
+            # CollisionAvoidanceLimit work this session already had to account for.
             reach_vec = raw_target - self._shoulder_pos[side]
             reach = float(np.linalg.norm(reach_vec))
-            reached_limit = reach > REACH_RADIUS
+            reached_limit = (not self._weighted_ik) and reach > REACH_RADIUS
             if reached_limit:
                 raw_target = self._shoulder_pos[side] + reach_vec * (REACH_RADIUS / reach)
 
@@ -615,7 +698,15 @@ class TeleopController:
                 # apply the controller's rotation-since-calibration onto the arm's
                 # natural HOME orientation
                 quat_delta = _relative_quat(self._vr_ref_quat[side], vr_quat)
-                target_quat = _apply_relative_quat(quat_delta, self._robot_ref_quat[side])
+                raw_target_quat = _apply_relative_quat(quat_delta, self._robot_ref_quat[side])
+                # rate-limit the ORIENTATION target the same way target_pos already is
+                # above -- see TARGET_MAX_ANGULAR_SPEED's own comment for why this is
+                # load-bearing, not defensive: a momentarily glitchy orientation reading
+                # can look like a normal (small) POSITION move and sail past _filter_vr's
+                # position-only glitch gate, producing a large one-step joint swing.
+                target_quat = _rate_limit_quat(raw_target_quat, self._target_quat_prev[side],
+                                               max_target_angle_step)
+                self._target_quat_prev[side] = target_quat
                 ori_w = (TELEOP_WEIGHTED_ORI_WEIGHT if self._weighted_ik
                          else TELEOP_ORI_WEIGHT)
                 q = ik.solve(target_pos, target_quat=target_quat, iters=IK_ITERS,
@@ -653,6 +744,25 @@ class TeleopController:
                     print(f"[teleop] {side} controller reaching past the arm's "
                           f"{REACH_RADIUS*100:.0f}cm envelope -- target pinned at the edge; "
                           f"move back toward centre, or the table is just out of reach here")
+                drop_pct = 100.0 * self._drop_count[side] / self._steps_per_sec
+                if drop_pct > 5.0:
+                    # A real headset's controller-pose update rate is very likely lower
+                    # than this loop's 500Hz physics rate -- if the real update period is
+                    # long enough that a genuine hand motion's per-sample jump exceeds
+                    # VR_GLITCH_TOL, _filter_vr rejects it as a tracking dropout instead of
+                    # following it, which looks exactly like laggy/discrete arm motion even
+                    # though the IK solver itself is tracking its (held) target correctly.
+                    # A consistently high rate here (not just an occasional real dropout)
+                    # points at that mismatch, not at the IK solver -- see teleop_control.py
+                    # module docstring / CLAUDE.md "Teleop Input (Phase 2)" for the fix
+                    # (VR_GLITCH_TOL is currently a fixed constant, not headset-rate-aware).
+                    print(f"[teleop] {side}: {drop_pct:.0f}% of the last ~1s of controller "
+                          f"frames were rejected as tracking glitches (VR_GLITCH_TOL="
+                          f"{VR_GLITCH_TOL*100:.0f}cm) -- if this stays high during normal "
+                          f"smooth motion, the arm will look laggy/discrete even though the "
+                          f"solver is tracking correctly; consider raising VR_GLITCH_TOL or "
+                          f"checking the actual headset data rate")
+                self._drop_count[side] = 0
             if verbose:
                 ori_str = ""
                 if self._track_orientation:
