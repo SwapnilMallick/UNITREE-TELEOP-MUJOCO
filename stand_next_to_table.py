@@ -54,6 +54,7 @@ from actuator_groups import LEG, WAIST, LEFT_ARM, LEFT_HAND, RIGHT_ARM, RIGHT_HA
 from pick_sequence import PickSequence
 from teleop_control import TeleopController, FpvStreamer, HandRetargeter
 from episode_recording import EpisodeRecorder
+from brick_snap import BrickSnapper, DEFAULT_HORIZ_TOL
 
 # brick1/brick2 (right arm) and brick3 (left arm) all pass verify_arm_ik.py's
 # reach+real-simulated-drive check, but NONE currently pass verify_grasp_hold.py
@@ -102,14 +103,17 @@ def _free_joint_slices(m, body_name):
     return slice(qa, qa + 7), slice(va, va + 6)
 
 
-def reset_bricks(m, d, brick_reset):
+def reset_bricks(m, d, brick_reset, snapper=None):
     """Teleport all three bricks back to their captured (position + orientation)
     pose and zero their velocity -- used by the 'R' key and, in --teleop, the
     left controller's X button. Deliberately touches ONLY the brick freejoints,
     never the robot -- safe to press mid-teleop without disturbing calibration
     or the arm's current pose (if a brick was being carried, it will visibly
     teleport out of the gripper -- that's the intended "start this pick over"
-    behavior, not a bug)."""
+    behavior, not a bug). Any snap-fit welds are released first so a reset
+    brick isn't dragged back by a stale weld."""
+    if snapper is not None:
+        snapper.reset(d)
     for qpos_slice, qvel_slice, qpos0 in brick_reset.values():
         d.qpos[qpos_slice] = qpos0
         d.qvel[qvel_slice] = 0.0
@@ -225,6 +229,20 @@ def parse_args():
                               "~0.7ms), 'lm' (Pinocchio weighted Levenberg-Marquardt, "
                               "~1ms, only Z-axis-faithful, kept as a mink-free fallback), "
                               "or 'ipopt' (CasADi/IPOPT NLP, slower -- runs decimated).")
+    parser.add_argument("--no-brick-snap", action="store_true",
+                         help="disable stud/groove snap-fit (brick_snap.py). By default a "
+                              "brick lowered onto another with aligned studs/grooves seats "
+                              "and locks (weld), and pulls off / breaks free under load; "
+                              "misaligned bricks just rest on the stud tips. (The side "
+                              "dovetail joint is physical collision geometry in the scene "
+                              "XML and is not affected by this flag.)")
+    parser.add_argument("--snap-tol", type=float, default=DEFAULT_HORIZ_TOL, metavar="M",
+                         help="snap horizontal alignment tolerance in metres (default "
+                              "%.4f = 5%% of a stud pitch, the reference simulator's "
+                              "Phase 2 value; raise for looser, VR-friendlier seating)."
+                              % DEFAULT_HORIZ_TOL)
+    parser.add_argument("--snap-yaw-tol", type=float, default=5.0, metavar="DEG",
+                         help="snap yaw alignment tolerance in degrees (default 5).")
     return parser.parse_args()
 
 def main():
@@ -259,6 +277,11 @@ def main():
     for name in ALL_BRICK_NAMES:
         qpos_slice, qvel_slice = _free_joint_slices(m, name)
         brick_reset[name] = (qpos_slice, qvel_slice, m.key_qpos[key_id][qpos_slice].copy())
+
+    snapper = None
+    if not args.no_brick_snap:
+        snapper = BrickSnapper(m, ALL_BRICK_NAMES, horiz_tol=args.snap_tol,
+                               yaw_tol_deg=args.snap_yaw_tol)
 
     seq = None
     tele_source = None
@@ -350,6 +373,7 @@ def main():
     calib_state = {"waiting_printed": False}  # for the 'hold still to calibrate' hint
     reset_btn_state = {"prev": False}  # edge-detects the VR reset button (see below)
     recalib_btn_state = {"prev": False}  # edge-detects the VR recalibrate button (see below)
+    record_btn_state = {"prev": False}   # edge-detects the VR record-toggle button (see below)
     if args.record_episodes is not None:
         if args.teleop:
             episode_goal = f"teleop ({'hand-tracking' if args.hand_tracking else 'controllers'})"
@@ -360,9 +384,10 @@ def main():
         recorder = EpisodeRecorder(m, task_dir=str(args.record_episodes),
                                     goal=episode_goal,
                                     extra_bodies=list(ALL_BRICK_NAMES))  # every brick's ground truth
-        print(f"episode recording armed -- press 's' in the viewer window to start an "
-              f"episode into {args.record_episodes}/, 's' again to stop and save it "
-              f"(repeat for more takes). Nothing records until the first 's'.")
+        print(f"episode recording armed -- press 's' in the viewer window (or the RIGHT "
+              f"controller's B button, with --teleop) to start an episode into "
+              f"{args.record_episodes}/, again to stop and save it (repeat for more takes). "
+              f"Nothing records until the first press.")
 
     def key_callback(keycode):
         # GLFW reports letter keys as their uppercase ASCII code.
@@ -381,7 +406,7 @@ def main():
             calib_state["waiting_printed"] = False
             print("\nteleop: re-calibrating -- hold both controllers still for a moment")
         if keycode == ord("R"):
-            reset_bricks(m, d, brick_reset)
+            reset_bricks(m, d, brick_reset, snapper)
             print("\nbricks reset to stand_at_table pose ('r')")
 
     with mujoco.viewer.launch_passive(m, d, key_callback=key_callback) as viewer:
@@ -415,7 +440,7 @@ def main():
                     # since it never touches the arms.
                     x_pressed = bool(getattr(data, "left_ctrl_aButton", False))
                     if x_pressed and not reset_btn_state["prev"]:
-                        reset_bricks(m, d, brick_reset)
+                        reset_bricks(m, d, brick_reset, snapper)
                         print("\nteleop: X button -- bricks reset to stand_at_table pose")
                     reset_btn_state["prev"] = x_pressed
                     # Right controller A button -> recalibrate (VR equivalent of
@@ -434,6 +459,19 @@ def main():
                         print("\nteleop: A button -- re-calibrating, hold both "
                               "controllers still for a moment")
                     recalib_btn_state["prev"] = a_pressed
+                    # Right controller B button -> start/stop episode recording (VR
+                    # equivalent of the 's' key; only does anything with
+                    # --record-episodes). Edge-detected, and independent of
+                    # calibration. Field name confirmed in televuer's TeleData
+                    # (`right_ctrl_bButton`).
+                    b_pressed = bool(getattr(data, "right_ctrl_bButton", False))
+                    if b_pressed and not record_btn_state["prev"]:
+                        if recorder is not None:
+                            record_state["toggle"] = True
+                        else:
+                            print("\nteleop: B button -- recording is not armed "
+                                  "(re-run with --record-episodes DIR)")
+                    record_btn_state["prev"] = b_pressed
                     if not teleop_ctrl.calibrated:
                         # Gated: try_calibrate captures the reference only once the
                         # controllers report a stable, non-stale pose for a moment
@@ -491,6 +529,8 @@ def main():
                         print(f"    grasped={seq.confidence['grasped']}  "
                               f"confidence={seq.confidence['confidence']:.2f}", end="\r")
                 mujoco.mj_step(m, d)
+                if snapper is not None:
+                    snapper.step(d)
 
                 if recorder is not None:
                     # 's' key toggles recording (xr_teleoperate's convention):
