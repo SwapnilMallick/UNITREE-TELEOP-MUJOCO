@@ -6,7 +6,7 @@ sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(_
 from brick_snap import BrickSnapper
 m=mujoco.MjModel.from_xml_path('/Users/swapnilmallick/Desktop/mujoco_menagerie/unitree_g1/scene_fixed_table.xml')
 key=mujoco.mj_name2id(m,mujoco.mjtObj.mjOBJ_KEY,'stand_at_table')
-S=BrickSnapper(m,[f'brick{i}' for i in range(1,6)]); d=mujoco.MjData(m)
+S=BrickSnapper(m,[f'brick{i}' for i in range(1,4)]); d=mujoco.MjData(m)
 mujoco.mj_resetDataKeyframe(m,d,key); d.ctrl[:]=m.key_ctrl[key]
 r=mujoco.Renderer(m,480,640)
 cam=mujoco.MjvCamera(); cam.type=mujoco.mjtCamera.mjCAMERA_FREE
@@ -33,7 +33,7 @@ imageio.mimsave('videos/brick_snap.mp4',frames,fps=30)
 
 
 # ------------------------------------------------ side (dovetail) snap: lowered from ABOVE
-S = BrickSnapper(m, [f'brick{i}' for i in range(1, 6)]); d = mujoco.MjData(m)
+S = BrickSnapper(m, [f'brick{i}' for i in range(1, 4)]); d = mujoco.MjData(m)
 mujoco.mj_resetDataKeyframe(m, d, key); d.ctrl[:] = m.key_ctrl[key]
 frames = []
 ys = iter([0.12, 0.22, 0.32, 0.42])          # clear the table: stash the bricks we don't use

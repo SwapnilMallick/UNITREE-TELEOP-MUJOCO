@@ -5,6 +5,7 @@ certs/
 *.pem
 recordings/
 CLAUDE.md
+TELEOP_FLOW.md
 *.txt
 /brick_size_check/
 /assets/

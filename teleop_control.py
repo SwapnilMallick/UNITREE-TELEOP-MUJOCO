@@ -837,6 +837,32 @@ class FpvStreamer:
         # sample every Nth physics step to approximate fps in real time
         self.frame_every = max(int(round((1.0 / fps) / m.opt.timestep)), 1)
         self._step_count = 0
+        self._message = None          # (text, expiry wall time, BGR colour)
+
+    def set_message(self, text, seconds=3.0, ok=True):
+        """Show `text` over the streamed view for `seconds` (wall time) -- the headset can only see
+        what is drawn into the frame, so status/refusal messages (e.g. brick_spawner's) go here.
+        Green for `ok`, red otherwise."""
+        import time
+        self._message = (text, time.time() + seconds, (80, 220, 80) if ok else (60, 60, 255))
+
+    def _draw_message(self, frame):
+        if self._message is None:
+            return frame
+        import time
+        import cv2
+        text, until, colour = self._message
+        if time.time() > until:
+            self._message = None
+            return frame
+        frame = np.ascontiguousarray(frame)
+        h, w = frame.shape[:2]
+        scale = w / 900.0
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
+        org = (max((w - tw) // 2, 4), h - int(0.08 * h))
+        cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 5, cv2.LINE_AA)
+        cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, colour, 2, cv2.LINE_AA)
+        return frame
 
     def _render_bgr(self, d, camera_name):
         self.renderer.update_scene(d, camera=camera_name)
@@ -847,7 +873,7 @@ class FpvStreamer:
         # conversion undoes it and the final displayed color is correct.
         # Confirmed on real hardware: without this, a wood-brown table showed
         # up blue in the headset (R/B channels swapped).
-        return frame[..., ::-1]
+        return self._draw_message(frame[..., ::-1])
 
     def step(self, d, sink):
         """Call once per control step. Returns True on steps a frame was

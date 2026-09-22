@@ -41,10 +41,15 @@ since no headset is reachable from this dev environment).
                                                           # the first 's'.
 
 Viewer keys: 's' toggles episode recording, 'c' re-runs teleop calibration,
-'r' resets the three bricks to their stand_at_table pose. In --teleop, the
-left controller's X button does the same brick reset as 'r', and the right
-controller's A button does the same recalibration as 'c' (both UNVERIFIED
-against a real headset -- see the comments at their wiring in main()).
+'r' resets brick1-3 to their stand_at_table pose and re-parks every spare
+(inventory back to 10), '1' / '3' spawn a spare brick into slot 1 / slot 3 (the
+resting poses of brick1 / brick3; refused, spare kept, if the slot is occupied --
+see brick_spawner.py). In --teleop, the left controller's X button does the same
+reset as 'r', the right controller's A button does the same recalibration as 'c',
+the RIGHT grip (squeeze) spawns into slot 1 (right-arm side) and the LEFT grip into
+slot 3 (left-arm side) (all UNVERIFIED against a real headset -- see the comments at
+their wiring in main()). Spawn/refusal messages print to the terminal and, with
+--display-mode ego/immersive, are drawn into the streamed view.
 """
 import argparse, time, pathlib, os
 import numpy as np
@@ -55,39 +60,33 @@ from pick_sequence import PickSequence
 from teleop_control import TeleopController, FpvStreamer, HandRetargeter
 from episode_recording import EpisodeRecorder
 from brick_snap import BrickSnapper, DEFAULT_HORIZ_TOL
+from brick_spawner import BrickSpawner
 
 # brick1/brick2 (right arm) and brick3 (left arm) all pass verify_arm_ik.py's
 # reach+real-simulated-drive check, but NONE currently pass verify_grasp_hold.py
 # -- a pre-existing regression from the brick-enlargement work (scale 0.015 ->
-# 0.025) that predates brick4/brick5 and isn't fixed here: brick1 doesn't even
-# lift off the table, brick2 lifts partway and doesn't hold, and brick3 has
-# its own separate, older grasp-approach-geometry problem (the left wrist
-# collides with it). --pick still works for all of them, just don't expect a
-# held grasp until the fingertip/contact tuning is redone for the new size.
+# 0.025) that isn't fixed here: brick1 doesn't even lift off the table, brick2
+# lifts partway and doesn't hold, and brick3 has its own separate, older
+# grasp-approach-geometry problem (the left wrist collides with it). --pick
+# still works for all of them, just don't expect a held grasp until the
+# fingertip/contact tuning is redone for the new size.
 #
-# brick4 (right arm) and brick5 (left arm) were added the same way brick1-3
-# originally were: paired with the arm on their own side (right reaches -Y,
-# left reaches +Y -- see verify_arm_ik.py's CASES comment), then verified via
-# verify_arm_ik.py's reach+drive check (both PASS, ~1.8cm error, no pelvis
-# drift/NaN) AND a direct d.contact check confirming the approach never
-# touches the adjacent brick (brick4<->brick1, brick5<->brick3) or anything
-# else beyond each brick's own normal resting contact with the table. Same
-# caveat as brick1-3 above applies: reach is verified, grasp-hold is not.
+# brick4/brick5 used to be fixed table bricks here (the two farthest out, beyond
+# the arms' reach); they were removed -- bricks 4..13 are now the SPARE pool,
+# parked off-scene and spawned into slot 1/3 on demand (brick_spawner.py).
 PICK_TARGETS = {
     "brick1": ("right", "right_gripper_site", RIGHT_ARM, RIGHT_HAND, "brick1"),
     "brick2": ("right", "right_gripper_site", RIGHT_ARM, RIGHT_HAND, "brick2"),
     "brick3": ("left",  "left_gripper_site",  LEFT_ARM,  LEFT_HAND,  "brick3"),
-    "brick4": ("right", "right_gripper_site", RIGHT_ARM, RIGHT_HAND, "brick4"),
-    "brick5": ("left",  "left_gripper_site",  LEFT_ARM,  LEFT_HAND,  "brick5"),
 }
 
-# Every brick on the table. Now that brick4/brick5 are also in PICK_TARGETS
-# this happens to equal its keys, but kept as its own name (derived, not
-# duplicated) so reset_bricks()/EpisodeRecorder's ground truth keep covering
-# "every brick on the table" rather than "every pick-assigned brick" even if
-# a future brick is ever added as decoration only, the way brick4/5 briefly
-# were.
-ALL_BRICK_NAMES = tuple(PICK_TARGETS)
+# Every brick in the scene: the three table bricks + the 10 spares (see make_brick_pool.py).
+# Not derived from PICK_TARGETS -- the spares aren't pick targets. Feeds reset_bricks(), the
+# BrickSnapper (which must know every brick, or a parked spare would count as a "robot geom")
+# and EpisodeRecorder's ground truth.
+N_TABLE_BRICKS = 3
+N_BRICKS = 13
+ALL_BRICK_NAMES = tuple(f"brick{i}" for i in range(1, N_BRICKS + 1))
 
 def _free_joint_slices(m, body_name):
     """qpos (7: xyz + wxyz quat) and qvel (6: linear + angular) slices for a
@@ -103,10 +102,11 @@ def _free_joint_slices(m, body_name):
     return slice(qa, qa + 7), slice(va, va + 6)
 
 
-def reset_bricks(m, d, brick_reset, snapper=None):
-    """Teleport all three bricks back to their captured (position + orientation)
-    pose and zero their velocity -- used by the 'R' key and, in --teleop, the
-    left controller's X button. Deliberately touches ONLY the brick freejoints,
+def reset_bricks(m, d, brick_reset, snapper=None, spawner=None):
+    """Teleport brick1-3 back to their captured (position + orientation)
+    pose, zero their velocity and re-park every spare (`spawner.restock`, which
+    also re-activates the parking welds) -- used by the 'R' key and, in --teleop,
+    the left controller's X button. Deliberately touches ONLY the brick freejoints,
     never the robot -- safe to press mid-teleop without disturbing calibration
     or the arm's current pose (if a brick was being carried, it will visibly
     teleport out of the gripper -- that's the intended "start this pick over"
@@ -117,6 +117,8 @@ def reset_bricks(m, d, brick_reset, snapper=None):
     for qpos_slice, qvel_slice, qpos0 in brick_reset.values():
         d.qpos[qpos_slice] = qpos0
         d.qvel[qvel_slice] = 0.0
+    if spawner is not None:
+        spawner.restock(d)
     mujoco.mj_forward(m, d)
 
 
@@ -273,6 +275,9 @@ def main():
     # Captured once, from the SAME keyframe the bricks were just reset from --
     # reset_bricks() below replays this rather than re-deriving a "default"
     # pose, so a mid-run reset always matches stand_at_table exactly.
+    scene_bricks = {m.body(i).name for i in range(m.nbody) if m.body(i).name.startswith("brick")}
+    assert scene_bricks == set(ALL_BRICK_NAMES), \
+        f"scene has {sorted(scene_bricks)}, expected {N_BRICKS} pool bricks (run make_brick_pool.py)"
     brick_reset = {}
     for name in ALL_BRICK_NAMES:
         qpos_slice, qvel_slice = _free_joint_slices(m, name)
@@ -282,6 +287,10 @@ def main():
     if not args.no_brick_snap:
         snapper = BrickSnapper(m, ALL_BRICK_NAMES, horiz_tol=args.snap_tol,
                                yaw_tol_deg=args.snap_yaw_tol)
+
+    spawner = BrickSpawner(m, key_id, table_bricks=ALL_BRICK_NAMES[:N_TABLE_BRICKS])
+    print(f"brick pool: {spawner.inventory} spare bricks -- spawn into slot 1 / slot 3 with the "
+          f"right / left grip (keys '1' / '3'); X or 'r' resets and restocks")
 
     seq = None
     tele_source = None
@@ -374,6 +383,14 @@ def main():
     reset_btn_state = {"prev": False}  # edge-detects the VR reset button (see below)
     recalib_btn_state = {"prev": False}  # edge-detects the VR recalibrate button (see below)
     record_btn_state = {"prev": False}   # edge-detects the VR record-toggle button (see below)
+    spawn_btn_state = {1: False, 3: False}   # edge-detects the VR grips (right -> slot 1, left -> slot 3)
+    spawn_req = {"slot": None}               # set by the viewer key / VR grip, served in the main loop
+
+    def notify(msg, ok=True):
+        """Terminal + (with --display-mode ego/immersive) the streamed headset view."""
+        print(f"\nbricks: {msg}")
+        if fpv_streamer is not None:
+            fpv_streamer.set_message(msg, ok=ok)
     if args.record_episodes is not None:
         if args.teleop:
             episode_goal = f"teleop ({'hand-tracking' if args.hand_tracking else 'controllers'})"
@@ -406,8 +423,11 @@ def main():
             calib_state["waiting_printed"] = False
             print("\nteleop: re-calibrating -- hold both controllers still for a moment")
         if keycode == ord("R"):
-            reset_bricks(m, d, brick_reset, snapper)
-            print("\nbricks reset to stand_at_table pose ('r')")
+            reset_bricks(m, d, brick_reset, snapper, spawner)
+            notify(f"reset -- brick1-3 back on the table, {spawner.inventory} spares ('r')")
+        # '1' / '3' -> spawn a spare into slot 1 / slot 3 (keyboard twin of the VR grips)
+        if keycode in (ord("1"), ord("3")):
+            spawn_req["slot"] = 1 if keycode == ord("1") else 3
 
     with mujoco.viewer.launch_passive(m, d, key_callback=key_callback) as viewer:
         if args.view == "egocentric":
@@ -440,9 +460,21 @@ def main():
                     # since it never touches the arms.
                     x_pressed = bool(getattr(data, "left_ctrl_aButton", False))
                     if x_pressed and not reset_btn_state["prev"]:
-                        reset_bricks(m, d, brick_reset, snapper)
-                        print("\nteleop: X button -- bricks reset to stand_at_table pose")
+                        reset_bricks(m, d, brick_reset, snapper, spawner)
+                        notify(f"reset -- brick1-3 back on the table, {spawner.inventory} spares (X)")
                     reset_btn_state["prev"] = x_pressed
+                    # Grip (squeeze) buttons -> spawn a spare brick: RIGHT grip -> slot 1
+                    # (brick1's resting spot, right-arm side), LEFT grip -> slot 3 (brick3's,
+                    # left-arm side). The squeeze isn't used by the teleop loop (the TRIGGER
+                    # drives the fingers). Edge-detected; televuer's `*_ctrl_squeeze` bool,
+                    # with the analogue `*_ctrl_squeezeValue` (>0.5) as a fallback.
+                    # UNVERIFIED against a real headset press.
+                    for slot, side in ((1, "right"), (3, "left")):
+                        pressed = bool(getattr(data, f"{side}_ctrl_squeeze", False)) or \
+                            float(getattr(data, f"{side}_ctrl_squeezeValue", 0.0) or 0.0) > 0.5
+                        if pressed and not spawn_btn_state[slot]:
+                            spawn_req["slot"] = slot
+                        spawn_btn_state[slot] = pressed
                     # Right controller A button -> recalibrate (VR equivalent of
                     # the 'c' key). Same aButton/bButton caveat as the left
                     # controller's reset button above: "aButton" is the generic
@@ -528,6 +560,10 @@ def main():
                     if phase == "HOLD" and seq.confidence is not None:
                         print(f"    grasped={seq.confidence['grasped']}  "
                               f"confidence={seq.confidence['confidence']:.2f}", end="\r")
+                if spawn_req["slot"] is not None:
+                    slot, spawn_req["slot"] = spawn_req["slot"], None
+                    ok, msg = spawner.spawn(d, slot)
+                    notify(msg, ok)
                 mujoco.mj_step(m, d)
                 if snapper is not None:
                     snapper.step(d)

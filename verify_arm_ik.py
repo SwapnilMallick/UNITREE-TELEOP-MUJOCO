@@ -51,19 +51,12 @@ SCENE = MODEL_DIR / "scene_fixed_table.xml"
 # (10.5cm) -- so the assignment is: right arm takes both brick1 and brick2,
 # left arm takes brick3.
 #
-# brick4 (y=-0.30) and brick5 (y=0.30) are further off-center than brick1/
-# brick3 respectively, on the SAME side each -- unlike brick2, there's no
-# dead-center ambiguity here, so (matching how brick1/brick3 themselves were
-# tested) each gets only its natural-side arm rather than a both-arms check.
-# Still run through the SAME real-simulated-drive test as every other brick,
-# not just an IK-only solve -- per this module's own docstring, IK
-# convergence alone doesn't rule out a self-collision along the approach.
+# (brick4/brick5 used to be checked here; they were removed as fixed table bricks -- bricks 4-13 are now
+# the parked spare pool, see brick_spawner.py.)
 CASES = [
     ("right", "right_gripper_site", RIGHT_ARM, "brick1"),  # brick1 y=-0.20
     ("right", "right_gripper_site", RIGHT_ARM, "brick2"),  # brick2 y=-0.07 (moved off-center)
     ("left",  "left_gripper_site",  LEFT_ARM,  "brick3"),  # brick3 y=+0.15
-    ("right", "right_gripper_site", RIGHT_ARM, "brick4"),  # brick4 y=-0.30
-    ("left",  "left_gripper_site",  LEFT_ARM,  "brick5"),  # brick5 y=+0.30
 ]
 
 # A pre-grasp point above the brick, not its exact resting center -- the brick

@@ -12,7 +12,8 @@ from brick_snap import BrickSnapper
 
 MODEL_DIR = pathlib.Path(os.environ.get(
     "MODEL_DIR", pathlib.Path(__file__).resolve().parent.parent / "mujoco_menagerie" / "unitree_g1"))
-NAMES = [f"brick{i}" for i in range(1, 6)]
+# brick1-3 only: brick4..13 are the parked spare pool (brick_spawner.py, verified separately)
+NAMES = [f"brick{i}" for i in range(1, 4)]
 m = mujoco.MjModel.from_xml_path(str(MODEL_DIR / "scene_fixed_table.xml"))
 key = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_KEY, "stand_at_table")
 results = []
@@ -88,7 +89,8 @@ d.qpos[a + 3:a + 7] = d.body("brick2").xquat; run(S, d, 3000)
 check("reverse-order stack holds", S.welded == {"brick1": "brick2"} and len(S.events) == 1, str(S.events))
 
 S.reset(d)
-check("reset clears welds", len(S.welded) == 0 and not d.eq_active[:].any())
+snap_eqs = [i for i in range(m.neq) if m.eq(i).name.startswith("snap_")]   # park_* welds stay on
+check("reset clears welds", len(S.welded) == 0 and not d.eq_active[snap_eqs].any())
 
 # ------------------------------------------- dovetail joint: PHYSICAL (compound collision), from above
 # Tab on the -X end, slot on the +X end (scene XML / make_brick_dovetail.py). No weld, no teleport:
@@ -100,7 +102,7 @@ def arena(anchor_name, x, y=-0.05):
     """Fresh scene, every brick but `anchor_name` stashed on the far side of the table, anchor re-laid
     with identity yaw at (x, y) so the mate slots are clear."""
     S, d = fresh()
-    ys = iter([0.12, 0.22, 0.32, 0.42, 0.47])
+    ys = iter([0.12, 0.22, 0.32])
     for n in S.names:
         a = S.qadr[n]
         d.qpos[a:a + 3] = [x, y, 0.79] if n == anchor_name else [0.5, next(ys), 0.79]
