@@ -1,0 +1,755 @@
+"""
+G1 standing fixed next to a table (no balance control needed), running
+either a scripted pick-lift-hold sequence or live VR teleoperation.
+
+The base is welded (freejoint removed) and the legs/waist are held at the
+'stand' keyframe by their position actuators. Everything above the waist
+(arms + Dex3-1 3-finger hands, indices 15..42) is available -- PickSequence
+(pick_sequence.py) drives it through approach -> orient -> close -> lift ->
+hold with a SCRIPTED target (--pick chooses which brick, read fresh from
+the live sim -- never hardcoded). --teleop instead drives it with LIVE
+input from a Quest 3S (or other televuer-supported headset) via
+TeleopController (teleop_control.py) -- same per-frame .step() contract,
+just fed by real controller data instead of a scripted timer. See
+teleop_control.py's module docstring for what's verified (the control-loop
+wiring, headlessly) vs. not (the coordinate mapping against real hardware,
+since no headset is reachable from this dev environment).
+
+    python stand_next_to_table.py                       # third-person view, picks brick1
+    python stand_next_to_table.py --view egocentric      # robot head POV, for teleoperation
+    python stand_next_to_table.py --pick brick2          # pick brick2 instead (also right arm)
+    python stand_next_to_table.py --pick none            # old behavior: just hold stance
+    python stand_next_to_table.py --teleop --cert-file cert.pem --key-file key.pem
+                                                          # live VR teleop, both arms (needs
+                                                          # `pip install televuer` and a headset)
+    python stand_next_to_table.py --teleop --cert-file cert.pem --key-file key.pem --hand-tracking
+                                                          # same, but real per-finger control
+                                                          # via dex_retargeting instead of
+                                                          # controller triggers (see
+                                                          # teleop_control.py's HandRetargeter)
+    python stand_next_to_table.py --view third_person /path/to/scene.xml
+    python stand_next_to_table.py --pick brick1 --record-episodes recordings/pick_brick1
+                                                          # also records frames+joint states/
+                                                          # actions per step via EpisodeRecorder
+                                                          # (episode_recording.py) -- works with
+                                                          # any driver (--pick, --teleop, ...),
+                                                          # runs in parallel, not wired into any
+                                                          # of them. Press 's' in the viewer to
+                                                          # start an episode, 's' again to stop
+                                                          # and save it, and so on (xr_teleoperate's
+                                                          # convention) -- nothing records until
+                                                          # the first 's'.
+
+Viewer keys: 's' toggles episode recording, 'c' re-runs teleop calibration,
+'r' resets brick1-3 to their stand_at_table pose and re-parks every spare
+(inventory back to 10), '1' / '3' spawn a spare brick into slot 1 / slot 3 (the
+resting poses of brick1 / brick3; refused, spare kept, if the slot is occupied --
+see brick_spawner.py). In --teleop, the left controller's X button does the same
+reset as 'r', the right controller's A button does the same recalibration as 'c',
+the RIGHT grip (squeeze) spawns into slot 1 (right-arm side) and the LEFT grip into
+slot 3 (left-arm side) (all UNVERIFIED against a real headset -- see the comments at
+their wiring in main()). Spawn/refusal messages print to the terminal and, with
+--display-mode ego/immersive, are drawn into the streamed view.
+"""
+import argparse, time, pathlib, os
+import numpy as np
+import mujoco, mujoco.viewer
+
+from actuator_groups import LEG, WAIST, LEFT_ARM, LEFT_HAND, RIGHT_ARM, RIGHT_HAND, UPPER_BODY
+from pick_sequence import PickSequence
+from teleop_control import TeleopController, FpvStreamer, HandRetargeter
+from episode_recording import EpisodeRecorder
+from brick_snap import BrickSnapper, DEFAULT_HORIZ_TOL
+from brick_spawner import BrickSpawner
+from locomotion import BaseVelocityCommand, PlanarBaseController, \
+    MAX_VX, MAX_VY, MAX_YAW_RATE, DEADZONE, SMOOTH_TAU
+import actuator_groups_planar
+
+# brick1/brick2 (right arm) and brick3 (left arm) all pass verify_arm_ik.py's
+# reach+real-simulated-drive check, but NONE currently pass verify_grasp_hold.py
+# -- a pre-existing regression from the brick-enlargement work (scale 0.015 ->
+# 0.025) that isn't fixed here: brick1 doesn't even lift off the table, brick2
+# lifts partway and doesn't hold, and brick3 has its own separate, older
+# grasp-approach-geometry problem (the left wrist collides with it). --pick
+# still works for all of them, just don't expect a held grasp until the
+# fingertip/contact tuning is redone for the new size.
+#
+# brick4/brick5 used to be fixed table bricks here (the two farthest out, beyond
+# the arms' reach); they were removed -- bricks 4..13 are now the SPARE pool,
+# parked off-scene and spawned into slot 1/3 on demand (brick_spawner.py).
+PICK_TARGETS = {
+    "brick1": ("right", "right_gripper_site", RIGHT_ARM, RIGHT_HAND, "brick1"),
+    "brick2": ("right", "right_gripper_site", RIGHT_ARM, RIGHT_HAND, "brick2"),
+    "brick3": ("left",  "left_gripper_site",  LEFT_ARM,  LEFT_HAND,  "brick3"),
+}
+
+# Every brick in the scene: the three table bricks + the 10 spares (see make_brick_pool.py).
+# Not derived from PICK_TARGETS -- the spares aren't pick targets. Feeds reset_bricks(), the
+# BrickSnapper (which must know every brick, or a parked spare would count as a "robot geom")
+# and EpisodeRecorder's ground truth.
+N_TABLE_BRICKS = 3
+N_BRICKS = 13
+ALL_BRICK_NAMES = tuple(f"brick{i}" for i in range(1, N_BRICKS + 1))
+
+def _free_joint_slices(m, body_name):
+    """qpos (7: xyz + wxyz quat) and qvel (6: linear + angular) slices for a
+    free-jointed body, looked up by name -- used by reset_bricks() below to
+    teleport a brick back to a captured pose without assuming a fixed index
+    (bricks sit after the robot's 43 qpos, but that's an implementation
+    detail this doesn't hardcode)."""
+    bid = m.body(body_name).id
+    jid = m.body_jntadr[bid]
+    assert m.jnt_type[jid] == mujoco.mjtJoint.mjJNT_FREE, f"{body_name} has no freejoint"
+    qa = m.jnt_qposadr[jid]
+    va = m.jnt_dofadr[jid]
+    return slice(qa, qa + 7), slice(va, va + 6)
+
+
+def reset_bricks(m, d, brick_reset, snapper=None, spawner=None):
+    """Teleport brick1-3 back to their captured (position + orientation)
+    pose, zero their velocity and re-park every spare (`spawner.restock`, which
+    also re-activates the parking welds) -- used by the 'R' key and, in --teleop,
+    the left controller's X button. Deliberately touches ONLY the brick freejoints,
+    never the robot -- safe to press mid-teleop without disturbing calibration
+    or the arm's current pose (if a brick was being carried, it will visibly
+    teleport out of the gripper -- that's the intended "start this pick over"
+    behavior, not a bug). Any snap-fit welds are released first so a reset
+    brick isn't dragged back by a stale weld."""
+    if snapper is not None:
+        snapper.reset(d)
+    for qpos_slice, qvel_slice, qpos0 in brick_reset.values():
+        d.qpos[qpos_slice] = qpos0
+        d.qvel[qvel_slice] = 0.0
+    if spawner is not None:
+        spawner.restock(d)
+    mujoco.mj_forward(m, d)
+
+
+# Resolved relative to this file (not the caller's cwd) so the script runs
+# from anywhere. The Menagerie clone is expected as a sibling of this repo:
+#   <parent>/mujoco_menagerie/unitree_g1
+# Override with the MODEL_DIR env var, or pass an explicit scene path as argv[1].
+MODEL_DIR = pathlib.Path(os.environ.get(
+    "MODEL_DIR",
+    pathlib.Path(__file__).resolve().parent.parent / "mujoco_menagerie" / "unitree_g1"))
+DEFAULT_SCENE = MODEL_DIR / "scene_fixed_table.xml"
+
+# the fixed camera baked into g1_fixed_upper.xml by make_fixed_base.py
+EGOCENTRIC_CAMERA = "fpv_teleop"
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("scene", nargs="?", type=pathlib.Path, default=DEFAULT_SCENE,
+                         help=f"path to scene xml (default: {DEFAULT_SCENE})")
+    parser.add_argument("--view", choices=["third_person", "egocentric"], default="third_person",
+                         help="camera view: 'third_person' (default, free orbit camera) or "
+                              "'egocentric' (robot head POV, for teleoperation)")
+    parser.add_argument("--pick", choices=[*PICK_TARGETS, "none"], default="brick1",
+                         help="which brick to run the scripted pick-lift-hold sequence on "
+                              "(default: brick1). 'none' reverts to just holding stance, the "
+                              "pre-PickSequence behavior. brick3 is a known, documented open "
+                              "issue (see CLAUDE.md) -- included for testing, not expected to succeed. "
+                              "Ignored if --teleop is given.")
+    parser.add_argument("--teleop", action="store_true",
+                         help="drive both arms live from a VR headset via televuer, instead of "
+                              "running the scripted --pick sequence. Requires `pip install "
+                              "televuer` (not installed in this dev environment) and a connected "
+                              "headset -- see teleop_control.py for what's verified vs. not.")
+    parser.add_argument("--cert-file", type=pathlib.Path, default=None,
+                         help="SSL cert file for televuer's HTTPS/WebRTC headset connection "
+                              "(see televuer's README, 'Generate Certificate Files'). Required "
+                              "with --teleop for most headsets.")
+    parser.add_argument("--key-file", type=pathlib.Path, default=None,
+                         help="SSL key file, paired with --cert-file.")
+    parser.add_argument("--display-mode", choices=["pass-through", "ego", "immersive"],
+                         default="pass-through",
+                         help="what the headset shows with --teleop (default: pass-through, "
+                              "the real world through the headset's own cameras -- no "
+                              "streaming). 'ego' streams the fpv_teleop camera into a small "
+                              "window with the real world around it; 'immersive' replaces the "
+                              "view entirely with fpv_teleop. Both stream over televuer's zmq "
+                              "transport, enabled automatically when set.")
+    parser.add_argument("--stereo-fpv", action="store_true",
+                         help="with --teleop and --display-mode ego/immersive, stream a real "
+                              "binocular (stereo) view instead of one mono frame shown to both "
+                              "eyes -- gives actual depth/parallax rather than a flat 2-D image "
+                              "filling the headset. Renders the fpv_teleop_left/fpv_teleop_right "
+                              "camera pair (make_fixed_base.py) and sends a side-by-side frame "
+                              "via TeleVuerWrapper(binocular=True). Off by default (mono, "
+                              "unchanged prior behavior); ignored with --display-mode "
+                              "pass-through.")
+    parser.add_argument("--hand-tracking", action="store_true",
+                         help="with --teleop, use real per-finger hand-tracking (via "
+                              "televuer's use_hand_tracking=True + dex_retargeting) instead "
+                              "of controller triggers. Requires `pip install dex_retargeting` "
+                              "(the upstream package, NOT unitreerobotics/xr_teleoperate's "
+                              "forked pin -- see teleop_control.py's HandRetargeter docstring) "
+                              "plus CPU torch. Default is controller mode (a trigger's grip "
+                              "scalar), matching the locked-in teleop design decision.")
+    parser.add_argument("--record-episodes", type=pathlib.Path, default=None, metavar="DIR",
+                         help="also record frames + joint states/actions per step via "
+                              "EpisodeRecorder (episode_recording.py), into DIR in "
+                              "xr_teleoperate's own per-episode data.json format. Works "
+                              "alongside any driver (--pick, --teleop, or --pick none) -- "
+                              "runs in parallel, not wired into any of them. Press 's' in "
+                              "the viewer to start an episode and 's' again to stop and save "
+                              "it (repeat for more takes); nothing records until the first "
+                              "'s'. Off by default.")
+    parser.add_argument("--teleop-debug", action="store_true",
+                         help="with --teleop, print calibration + per-frame IK diagnostics "
+                              "(captured reference poses, |pos_delta|, IK target, residual) "
+                              "-- for diagnosing the arm not following the controller. "
+                              "Off by default.")
+    parser.add_argument("--teleop-orientation", action="store_true",
+                         help="with --teleop, add 6-DOF IK following controller ORIENTATION. "
+                              "EXPERIMENTAL / poor: arm_ik's solver maps a controller "
+                              "rotation to a wildly axis-dependent gripper rotation and "
+                              "degrades position 10-25cm -- gives some orientation influence "
+                              "but not faithful control (needs a weighted IK). Default is "
+                              "position-only.")
+    parser.add_argument("--teleop-scale", type=float, default=None, metavar="S",
+                         help="with --teleop, controller-motion -> robot-motion scale "
+                              "(default: teleop_control.SCALE = 0.5). The operator's arm "
+                              "range is bigger than this arm's ~0.45m envelope, so <1.0 "
+                              "keeps targets reachable. Lower if the arm still hits limits; "
+                              "raise toward 1.0 if motion feels sluggish.")
+    parser.add_argument("--teleop-weighted-ik", action="store_true",
+                         help="with --teleop, use weighted_arm_ik.WeightedArmIK instead "
+                              "of arm_ik.py's DLS solver. This is the fix for "
+                              "--teleop-orientation: a controller rotation produces a "
+                              "faithful gripper rotation on all three axes (not the DLS "
+                              "solver's wild axis-dependent overshoot), the moving arm "
+                              "holds position, and the other arm stays essentially "
+                              "perfectly still. Position tracking is at least as good as "
+                              "DLS across every regime tested. Default backend 'mink' "
+                              "needs `pip install mink`; 'lm' needs only pinocchio (no new "
+                              "dep beyond what dex_retargeting already installs). Does NOT "
+                              "affect any scripted pick/stack path (arm_ik.py is "
+                              "untouched). Default: off.")
+    parser.add_argument("--teleop-weighted-ik-solver", choices=["mink", "lm", "ipopt"],
+                         default="mink",
+                         help="weighted-IK backend (with --teleop-weighted-ik): 'mink' "
+                              "(default -- MuJoCo-native QP IK, faithful on all axes, "
+                              "~0.7ms), 'lm' (Pinocchio weighted Levenberg-Marquardt, "
+                              "~1ms, only Z-axis-faithful, kept as a mink-free fallback), "
+                              "or 'ipopt' (CasADi/IPOPT NLP, slower -- runs decimated).")
+    parser.add_argument("--base-mode", choices=["fixed", "planar", "policy"], default="fixed",
+                         help="how the robot base is driven with --teleop, via both VR "
+                              "thumbsticks (previously unused -- every other button already "
+                              "has a function, see the module docstring). 'fixed' (default): "
+                              "the base is welded, unchanged original behavior, sticks do "
+                              "nothing. 'planar': 3-DOF kinematic slide/turn (locomotion.py's "
+                              "PlanarBaseController) -- legs stay locked at the standing pose, "
+                              "needs a scene built on g1_planar_base.xml (see "
+                              "make_planar_base.py/make_planar_scene.py), e.g. "
+                              "scene_planar_table.xml. 'policy': real bipedal gait via a "
+                              "pretrained RL policy (not yet implemented in this file -- "
+                              "Stage 2). Ignored without --teleop (no VR input to read sticks "
+                              "from); --pick is unaffected regardless of this flag.")
+    parser.add_argument("--base-max-vx", type=float, default=MAX_VX, metavar="M/S",
+                         help=f"max forward/back base speed with --base-mode planar/policy "
+                              f"(default {MAX_VX}).")
+    parser.add_argument("--base-max-vy", type=float, default=MAX_VY, metavar="M/S",
+                         help=f"max lateral (strafe) base speed (default {MAX_VY}).")
+    parser.add_argument("--base-max-yaw-rate", type=float, default=MAX_YAW_RATE, metavar="RAD/S",
+                         help=f"max turning rate (default {MAX_YAW_RATE}).")
+    parser.add_argument("--base-deadzone", type=float, default=DEADZONE, metavar="0-1",
+                         help=f"thumbstick deadzone, as a fraction of full deflection "
+                              f"(default {DEADZONE}).")
+    parser.add_argument("--base-smoothing", type=float, default=SMOOTH_TAU, metavar="S",
+                         help=f"low-pass time constant on the base velocity command "
+                              f"(default {SMOOTH_TAU}s) -- higher is smoother but laggier.")
+    parser.add_argument("--no-brick-snap", action="store_true",
+                         help="disable stud/groove snap-fit (brick_snap.py). By default a "
+                              "brick lowered onto another with aligned studs/grooves seats "
+                              "and locks (weld), and pulls off / breaks free under load; "
+                              "misaligned bricks just rest on the stud tips. (The side "
+                              "dovetail joint is physical collision geometry in the scene "
+                              "XML and is not affected by this flag.)")
+    parser.add_argument("--snap-tol", type=float, default=DEFAULT_HORIZ_TOL, metavar="M",
+                         help="snap horizontal alignment tolerance in metres (default "
+                              "%.4f = 5%% of a stud pitch, the reference simulator's "
+                              "Phase 2 value; raise for looser, VR-friendlier seating)."
+                              % DEFAULT_HORIZ_TOL)
+    parser.add_argument("--snap-yaw-tol", type=float, default=5.0, metavar="DEG",
+                         help="snap yaw alignment tolerance in degrees (default 5).")
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+    scene = args.scene
+    if not scene.exists():
+        raise SystemExit(f"scene file not found: {scene}\n"
+                          f"set MODEL_DIR or pass the scene path as an argument")
+    m = mujoco.MjModel.from_xml_path(str(scene))
+    d = mujoco.MjData(m)
+
+    # locomotion.PlanarBaseController no-ops gracefully if the loaded scene has
+    # no base_slide_x/base_slide_y/base_yaw joints (--base-mode fixed, the
+    # default, or any scene not built from make_planar_base.py) -- constructed
+    # unconditionally so downstream code never needs an if/else on base_mode
+    # just to call .pose_from()/.step(). But if the operator explicitly asked
+    # for planar/policy locomotion and the scene doesn't actually have it,
+    # that's a real misconfiguration (wrong scene file) -- fail loudly instead
+    # of silently driving a base that will never move.
+    base_ctrl = PlanarBaseController(m)
+    if args.base_mode in ("planar", "policy") and not base_ctrl.present:
+        raise SystemExit(
+            f"--base-mode {args.base_mode} needs a scene with "
+            f"base_slide_x/base_slide_y/base_yaw joints, but {scene} has none. "
+            f"Run make_planar_base.py + make_planar_scene.py and pass the "
+            f"resulting scene_planar_table.xml explicitly.")
+    if args.base_mode == "policy":
+        raise SystemExit("--base-mode policy is not implemented yet (Stage 2).")
+    base_cmd = BaseVelocityCommand(max_vx=args.base_max_vx, max_vy=args.base_max_vy,
+                                    max_yaw_rate=args.base_max_yaw_rate,
+                                    deadzone=args.base_deadzone,
+                                    smooth_tau=args.base_smoothing)
+
+    # Prefer "stand_at_table" (full-scene keyframe incl. brick poses, defined in
+    # scene_fixed_table.xml) over index 0: the robot-only "stand" keyframe from
+    # g1_fixed_upper.xml gets zero/identity-padded by the compiler for any bodies
+    # (e.g. bricks) it doesn't know about, which resets them to the world origin.
+    key_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_KEY, "stand_at_table")
+    if key_id < 0:
+        key_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_KEY, "stand")
+    if key_id < 0:
+        key_id = 0
+
+    # start in the stance pose and hold it
+    mujoco.mj_resetDataKeyframe(m, d, key_id)
+    hold = m.key_ctrl[key_id].copy()  # legs/waist -> 0, arms -> raised stance
+    d.ctrl[:] = hold
+    mujoco.mj_forward(m, d)
+
+    # Captured once, from the SAME keyframe the bricks were just reset from --
+    # reset_bricks() below replays this rather than re-deriving a "default"
+    # pose, so a mid-run reset always matches stand_at_table exactly.
+    scene_bricks = {m.body(i).name for i in range(m.nbody) if m.body(i).name.startswith("brick")}
+    assert scene_bricks == set(ALL_BRICK_NAMES), \
+        f"scene has {sorted(scene_bricks)}, expected {N_BRICKS} pool bricks (run make_brick_pool.py)"
+    brick_reset = {}
+    for name in ALL_BRICK_NAMES:
+        qpos_slice, qvel_slice = _free_joint_slices(m, name)
+        brick_reset[name] = (qpos_slice, qvel_slice, m.key_qpos[key_id][qpos_slice].copy())
+
+    snapper = None
+    if not args.no_brick_snap:
+        snapper = BrickSnapper(m, ALL_BRICK_NAMES, horiz_tol=args.snap_tol,
+                               yaw_tol_deg=args.snap_yaw_tol)
+
+    spawner = BrickSpawner(m, key_id, table_bricks=ALL_BRICK_NAMES[:N_TABLE_BRICKS])
+    print(f"brick pool: {spawner.inventory} spare bricks -- spawn into slot 1 / slot 3 with the "
+          f"right / left grip (keys '1' / '3'); X or 'r' resets and restocks")
+
+    seq = None
+    tele_source = None
+    teleop_ctrl = None
+    fpv_streamer = None
+    if args.teleop:
+        # Lazy import: televuer isn't installed in most dev environments
+        # (this one included) -- only needed when --teleop is actually used,
+        # matching the pattern already used for imageio in verify_stack_sequence.py.
+        try:
+            from televuer import TeleVuerWrapper
+        except ImportError as e:
+            raise SystemExit(
+                "--teleop needs the televuer package: pip install televuer\n"
+                "(see https://github.com/unitreerobotics/televuer)") from e
+        # display_mode="pass-through" (default) shows the real world through the
+        # headset's own cameras, no streaming. --display-mode ego/immersive streams
+        # the fpv_teleop camera instead -- see FpvStreamer in teleop_control.py;
+        # televuer requires zmq (or webrtc) enabled for either of those modes.
+        # --stereo-fpv: FpvStreamer renders fpv_teleop_left/_right and sends one
+        # side-by-side (left|right) frame; televuer's own source (read directly,
+        # not guessed) splits img_shape's width in HALF internally per eye when
+        # binocular=True, so img_shape's width must be doubled to 2*640 here --
+        # NOT the same (height, 640) used for the mono case below.
+        img_shape = (480, 1280) if args.stereo_fpv else (480, 640)
+        tele_source = TeleVuerWrapper(
+            use_hand_tracking=args.hand_tracking,  # controllers by default, matching
+                                                     # the locked-in teleop design decision
+            binocular=args.stereo_fpv,  # False (default): FpvStreamer renders one mono
+                                         # frame per camera. True: a real side-by-side
+                                         # stereo pair -- see --stereo-fpv above.
+            img_shape=img_shape,  # (height, width) -- must match FpvStreamer's actual
+                                   # rendered frame size exactly; televuer's img2display
+                                   # buffer is sized from THIS, independent of binocular
+                                   # (binocular=False alone did NOT fix the shape mismatch --
+                                   # confirmed empirically, this is the real knob)
+            display_mode=args.display_mode,
+            zmq=(args.display_mode != "pass-through"),
+            cert_file=str(args.cert_file) if args.cert_file else None,
+            key_file=str(args.key_file) if args.key_file else None,
+        )
+        hand_retargeter = None
+        if args.hand_tracking:
+            try:
+                hand_retargeter = HandRetargeter()
+            except ImportError as e:
+                raise SystemExit(
+                    "--hand-tracking needs the upstream dex_retargeting package "
+                    "(NOT unitreerobotics/xr_teleoperate's forked pin -- see "
+                    "teleop_control.py's HandRetargeter docstring for why):\n"
+                    "  pip install dex_retargeting\n"
+                    "  pip install torch --index-url https://download.pytorch.org/whl/cpu"
+                ) from e
+        teleop_kw = dict(hand_retargeter=hand_retargeter, debug=args.teleop_debug,
+                         track_orientation=args.teleop_orientation)
+        if args.base_mode in ("planar", "policy"):
+            # --base-mode planar/policy shift every qpos/dof address by +3
+            # (the 3 new base joints, root-body-first per MuJoCo's tree-order
+            # qpos assignment -- see actuator_groups_planar.py). ArmIK/
+            # WeightedArmIK index d.qpos internally and need the shifted
+            # slice; d.ctrl writes inside TeleopController always use the
+            # unshifted actuator_groups constants regardless (nu=43 either
+            # way -- no actuators were added for the base).
+            teleop_kw["arm_qpos_slices"] = {
+                "left": actuator_groups_planar.LEFT_ARM_QPOS,
+                "right": actuator_groups_planar.RIGHT_ARM_QPOS,
+            }
+        if args.teleop_scale is not None:
+            teleop_kw["scale"] = args.teleop_scale   # else TeleopController's own default
+        if args.teleop_weighted_ik:
+            teleop_kw["weighted_ik"] = True
+            teleop_kw["weighted_ik_mjcf"] = str(MODEL_DIR / "g1_fixed_upper.xml")
+            teleop_kw["weighted_ik_solver"] = args.teleop_weighted_ik_solver
+        try:
+            teleop_ctrl = TeleopController(m, **teleop_kw)
+        except ImportError as e:
+            raise SystemExit(
+                "--teleop-weighted-ik needs its solver deps:\n"
+                "  solver 'mink'  (default) -> pip install mink\n"
+                "  solver 'lm'    -> pinocchio (already a dex_retargeting dep here)\n"
+                "  solver 'ipopt' -> pip install casadi\n"
+                f"({e})"
+            ) from e
+        fpv_streamer = (FpvStreamer(m, EGOCENTRIC_CAMERA, stereo=args.stereo_fpv)
+                         if args.display_mode != "pass-through" else None)
+        print(f"teleop: waiting for headset connection + first "
+              f"{'hand-tracking' if args.hand_tracking else 'controller'} data...")
+    elif args.pick != "none":
+        side, site_name, arm_slice, hand_slice, brick_name = PICK_TARGETS[args.pick]
+        seq = PickSequence(m, side, site_name, arm_slice, hand_slice, brick_name)
+        seq.start(m, d)
+        print(f"picking {brick_name} with the {side} arm...")
+
+    # EpisodeRecorder runs in PARALLEL to whatever drives the arms above
+    # (--teleop / --pick / --pick none) -- it only READS the live MjData each
+    # step and never touches d.ctrl, so it records identically regardless of
+    # the driver. See episode_recording.py.
+    recorder = None
+    episode_n = 0
+    record_state = {"toggle": False, "awaiting_start": False}
+    calib_state = {"waiting_printed": False}  # for the 'hold still to calibrate' hint
+    reset_btn_state = {"prev": False}  # edge-detects the VR reset button (see below)
+    recalib_btn_state = {"prev": False}  # edge-detects the VR recalibrate button (see below)
+    record_btn_state = {"prev": False}   # edge-detects the VR record-toggle button (see below)
+    spawn_btn_state = {1: False, 3: False}   # edge-detects the VR grips (right -> slot 1, left -> slot 3)
+    spawn_req = {"slot": None}               # set by the viewer key / VR grip, served in the main loop
+
+    def notify(msg, ok=True):
+        """Terminal + (with --display-mode ego/immersive) the streamed headset view."""
+        print(f"\nbricks: {msg}")
+        if fpv_streamer is not None:
+            fpv_streamer.set_message(msg, ok=ok)
+    if args.record_episodes is not None:
+        if args.teleop:
+            episode_goal = f"teleop ({'hand-tracking' if args.hand_tracking else 'controllers'})"
+        elif args.pick != "none":
+            episode_goal = f"pick {args.pick} with the {PICK_TARGETS[args.pick][0]} arm"
+        else:
+            episode_goal = "hold stance"
+        recorder = EpisodeRecorder(m, task_dir=str(args.record_episodes),
+                                    goal=episode_goal,
+                                    extra_bodies=list(ALL_BRICK_NAMES))  # every brick's ground truth
+        print(f"episode recording armed -- press 's' in the viewer window (or the RIGHT "
+              f"controller's B button, with --teleop) to start an episode into "
+              f"{args.record_episodes}/, again to stop and save it (repeat for more takes). "
+              f"Nothing records until the first press.")
+
+    def key_callback(keycode):
+        # GLFW reports letter keys as their uppercase ASCII code.
+        # 's' -> toggle episode recording: first press starts an episode, next
+        #        press finalizes+saves it, and so on (xr_teleoperate's convention).
+        # 'c' -> drop teleop calibration and re-capture a fresh reference,
+        #        so a bad initial capture is recoverable without a restart.
+        # 'r' -> reset the three bricks to their stand_at_table pose (keyboard
+        #        equivalent of the VR left-controller X button below -- lets
+        #        this be exercised with no headset attached, same as every
+        #        other verify_*.py in this repo staying headless-testable).
+        if recorder is not None and keycode == ord("S"):
+            record_state["toggle"] = True
+        if teleop_ctrl is not None and keycode == ord("C"):
+            teleop_ctrl.request_recalibration()
+            calib_state["waiting_printed"] = False
+            print("\nteleop: re-calibrating -- hold both controllers still for a moment")
+        if keycode == ord("R"):
+            reset_bricks(m, d, brick_reset, snapper, spawner)
+            notify(f"reset -- brick1-3 back on the table, {spawner.inventory} spares ('r')")
+        # '1' / '3' -> spawn a spare into slot 1 / slot 3 (keyboard twin of the VR grips)
+        if keycode in (ord("1"), ord("3")):
+            spawn_req["slot"] = 1 if keycode == ord("1") else 3
+
+    with mujoco.viewer.launch_passive(m, d, key_callback=key_callback) as viewer:
+        if args.view == "egocentric":
+            viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
+            viewer.cam.fixedcamid = m.camera(EGOCENTRIC_CAMERA).id
+
+        last_phase = None
+        # try/finally so the in-progress episode is flushed to disk (and the
+        # writer's non-daemon worker thread joined) on a viewer close, an
+        # exception, or Ctrl-C -- without close() the process would hang on
+        # exit waiting for that thread.
+        try:
+            while viewer.is_running():
+                t0 = time.time()
+                base_cmd_tuple = None  # set below only in --teleop (joystick input lives on
+                                        # tele_data); stays None for --pick / --pick none, so
+                                        # recorder.step() below just omits actions["base"]
+                if teleop_ctrl is not None:
+                    data = tele_source.get_tele_data()
+                    # Left controller X button -> reset brick world positions.
+                    # televuer (like the underlying WebXR/Vuer layer) exposes
+                    # each controller's two face buttons generically as
+                    # "aButton"/"bButton" regardless of handedness -- on a
+                    # Quest 3S's Touch controllers that's physical X/Y on the
+                    # LEFT controller and A/B on the right, the standard
+                    # WebXR gamepad-button convention (button index 4/5).
+                    # UNVERIFIED against a real headset press from this dev
+                    # environment (no hardware reachable here, same caveat as
+                    # the rest of this file's --teleop path) -- if X doesn't
+                    # trigger it on your headset, try left_ctrl_bButton (Y)
+                    # instead. Edge-detected (reset once per press, not once
+                    # per frame held) and independent of calibration state,
+                    # since it never touches the arms.
+                    x_pressed = bool(getattr(data, "left_ctrl_aButton", False))
+                    if x_pressed and not reset_btn_state["prev"]:
+                        reset_bricks(m, d, brick_reset, snapper, spawner)
+                        notify(f"reset -- brick1-3 back on the table, {spawner.inventory} spares (X)")
+                    reset_btn_state["prev"] = x_pressed
+                    # Grip (squeeze) buttons -> spawn a spare brick: RIGHT grip -> slot 1
+                    # (brick1's resting spot, right-arm side), LEFT grip -> slot 3 (brick3's,
+                    # left-arm side). The squeeze isn't used by the teleop loop (the TRIGGER
+                    # drives the fingers). Edge-detected; televuer's `*_ctrl_squeeze` bool,
+                    # with the analogue `*_ctrl_squeezeValue` (>0.5) as a fallback.
+                    # UNVERIFIED against a real headset press.
+                    for slot, side in ((1, "right"), (3, "left")):
+                        pressed = bool(getattr(data, f"{side}_ctrl_squeeze", False)) or \
+                            float(getattr(data, f"{side}_ctrl_squeezeValue", 0.0) or 0.0) > 0.5
+                        if pressed and not spawn_btn_state[slot]:
+                            spawn_req["slot"] = slot
+                        spawn_btn_state[slot] = pressed
+                    # Right controller A button -> recalibrate (VR equivalent of
+                    # the 'c' key). Same aButton/bButton caveat as the left
+                    # controller's reset button above: "aButton" is the generic
+                    # WebXR/Vuer name for the controller's primary face button,
+                    # which on a Quest 3S's right Touch controller is physical A
+                    # (left controller's is X). UNVERIFIED against a real headset
+                    # press -- try right_ctrl_bButton (B) if A doesn't fire it.
+                    # Edge-detected and safe to press whether or not the arm is
+                    # currently calibrated (request_recalibration() is idempotent).
+                    a_pressed = bool(getattr(data, "right_ctrl_aButton", False))
+                    if a_pressed and not recalib_btn_state["prev"]:
+                        teleop_ctrl.request_recalibration()
+                        calib_state["waiting_printed"] = False
+                        print("\nteleop: A button -- re-calibrating, hold both "
+                              "controllers still for a moment")
+                    recalib_btn_state["prev"] = a_pressed
+                    # Right controller B button -> start/stop episode recording (VR
+                    # equivalent of the 's' key; only does anything with
+                    # --record-episodes). Edge-detected, and independent of
+                    # calibration. Field name confirmed in televuer's TeleData
+                    # (`right_ctrl_bButton`).
+                    b_pressed = bool(getattr(data, "right_ctrl_bButton", False))
+                    if b_pressed and not record_btn_state["prev"]:
+                        if recorder is not None:
+                            record_state["toggle"] = True
+                        else:
+                            print("\nteleop: B button -- recording is not armed "
+                                  "(re-run with --record-episodes DIR)")
+                    record_btn_state["prev"] = b_pressed
+                    # Joystick-driven base locomotion (--base-mode planar/policy
+                    # only -- base_ctrl.step() no-ops if the scene has no base
+                    # joints, i.e. --base-mode fixed). Runs regardless of arm
+                    # calibration state, same as fpv_streamer below -- the
+                    # operator can walk the robot around before their
+                    # controllers are tracked. zero command (coasts to a stop)
+                    # if the thumbstick fields are missing/stale -- see
+                    # locomotion.BaseVelocityCommand.update().
+                    vx, vy, yaw_rate = base_cmd.update(data, m.opt.timestep)
+                    base_ctrl.step(m, d, vx, vy, yaw_rate)
+                    base_cmd_tuple = (vx, vy, yaw_rate)
+                    if not teleop_ctrl.calibrated:
+                        # Gated: try_calibrate captures the reference only once the
+                        # controllers report a stable, non-stale pose for a moment
+                        # (see TeleopController.try_calibrate -- calibrating on a
+                        # stale first frame is the cause of the intermittent "arm
+                        # won't follow" failure). Until then, freeze the arms where
+                        # they are; legs/waist stay pinned to stance.
+                        if teleop_ctrl.try_calibrate(m, d, data):
+                            print("teleop: calibrated -- arms ramping to the ready pose, "
+                                  "then following the controllers")
+                            if teleop_ctrl.calib_warning:
+                                print(f"teleop: !! {teleop_ctrl.calib_warning} -- hold a "
+                                      f"relaxed, symmetric pose (hands in front of your chest, "
+                                      f"~30cm apart) and press 'c' to re-calibrate")
+                            calib_state["waiting_printed"] = False
+                        else:
+                            d.ctrl[LEG]   = hold[LEG]
+                            d.ctrl[WAIST] = hold[WAIST]
+                            if not calib_state["waiting_printed"]:
+                                print("teleop: hold both controllers still to calibrate...")
+                                calib_state["waiting_printed"] = True
+                    else:
+                        # TeleopController.step() lays down hold_ctrl for the WHOLE
+                        # array first, same contract as PickSequence.step() -- see
+                        # teleop_control.py. base_pose: (0,0,0) in --base-mode
+                        # fixed (base_ctrl.pose_from() no-ops to that), so arm
+                        # targets stay anchored in world frame exactly as before;
+                        # in planar/policy mode this is the base's CURRENT (x, y,
+                        # yaw), so TELEOP_HOME and the reach-clamp shoulder anchor
+                        # move with the body as it walks (see teleop_control.py's
+                        # step() docstring).
+                        teleop_ctrl.step(m, d, hold, data, base_pose=base_ctrl.pose_from(d))
+                        if args.hand_tracking:
+                            # last_grip is None per side in hand-tracking mode --
+                            # there's no single scalar, real per-finger joints instead
+                            print("  hand-tracking: retargeting live", end="\r")
+                        else:
+                            print(f"  grip L={teleop_ctrl.last_grip['left']:.2f} "
+                                  f"R={teleop_ctrl.last_grip['right']:.2f}", end="\r")
+                    if fpv_streamer is not None:
+                        # streams regardless of calibration state -- the operator
+                        # should be able to see the robot's view even before their
+                        # controllers are tracked; internally rate-limited, most
+                        # calls are a no-op (see FpvStreamer)
+                        fpv_streamer.step(d, tele_source)
+                elif seq is None:
+                    # --pick none: old behavior, just hold the stance every step
+                    d.ctrl[LEG]   = hold[LEG]
+                    d.ctrl[WAIST] = hold[WAIST]
+                    d.ctrl[UPPER_BODY] = hold[UPPER_BODY]
+                else:
+                    # PickSequence.step() lays down hold_ctrl for the WHOLE array
+                    # first, then overwrites only its own arm_slice/hand_slice --
+                    # so LEG/WAIST and the other arm/hand stay pinned to stance
+                    # without a separate write here.
+                    phase = seq.step(m, d, hold)
+                    if phase != last_phase:
+                        print(f"  phase: {phase}")
+                        last_phase = phase
+                    if phase == "HOLD" and seq.confidence is not None:
+                        print(f"    grasped={seq.confidence['grasped']}  "
+                              f"confidence={seq.confidence['confidence']:.2f}", end="\r")
+                if spawn_req["slot"] is not None:
+                    slot, spawn_req["slot"] = spawn_req["slot"], None
+                    ok, msg = spawner.spawn(d, slot)
+                    notify(msg, ok)
+                mujoco.mj_step(m, d)
+                if snapper is not None:
+                    snapper.step(d)
+
+                if recorder is not None:
+                    # 's' key toggles recording (xr_teleoperate's convention):
+                    # 1st press starts an episode, next press finalizes+saves it.
+                    if record_state["toggle"]:
+                        record_state["toggle"] = False
+                        if recorder.is_recording:
+                            recorder.end_episode()
+                            print(f"\nrecording stopped -- episode {episode_n} saved "
+                                  f"under {args.record_episodes}/")
+                        elif record_state["awaiting_start"]:
+                            record_state["awaiting_start"] = False
+                            print("\nrecording start cancelled (episode never began)")
+                        else:
+                            record_state["awaiting_start"] = True
+                    # create_episode() is async (returns False while the previous
+                    # save drains), so retry each frame until it takes.
+                    if record_state["awaiting_start"] and recorder.start_episode():
+                        record_state["awaiting_start"] = False
+                        episode_n += 1
+                        print(f"\nrecording episode {episode_n} into {args.record_episodes}/ "
+                              f"-- press 's' again to stop and save")
+                    # one sample per control step; internally rate-limited to the
+                    # writer's fps, so most calls are a no-op (see EpisodeRecorder).
+                    # No-ops entirely while stopped/between episodes. base_cmd_tuple
+                    # is None outside --teleop (no "base" action key written, old
+                    # recordings' shape unaffected); base qpos/dof slice is always
+                    # (0,3) when present -- make_planar_base.py guarantees the base
+                    # joints sit at the leading addresses.
+                    recorder.step(m, d, base_cmd=base_cmd_tuple,
+                                  base_qpos_slice=(slice(0, 3) if base_ctrl.present else None),
+                                  base_dof_slice=(slice(0, 3) if base_ctrl.present else None))
+
+                viewer.sync()
+                dt = m.opt.timestep - (time.time() - t0)
+                if dt > 0:
+                    time.sleep(dt)
+        finally:
+            if recorder is not None:
+                # flush an episode still in progress at viewer close / Ctrl-C
+                # (end_episode() no-ops if 's' already stopped it); close()
+                # joins the writer's non-daemon worker thread either way.
+                was_recording = recorder.is_recording
+                recorder.end_episode()
+                recorder.close()
+                if episode_n > 0:
+                    tail = " (in-progress take flushed)" if was_recording else ""
+                    print(f"\n{episode_n} episode(s) saved under "
+                          f"{args.record_episodes}/{tail}")
+                else:
+                    print("\nno episodes recorded ('s' was never pressed)")
+
+            # Explicitly tear down the offscreen renderers (their __del__ can
+            # otherwise throw a noisy 'Exception ignored' during interpreter
+            # shutdown) ...
+            for _obj in (fpv_streamer, recorder):
+                _r = getattr(_obj, "renderer", None)
+                if _r is not None:
+                    try:
+                        _r.close()
+                    except Exception:
+                        pass
+
+            # ... and, crucially, close televuer: TeleVuerWrapper.close()
+            # terminates its vuer server child process, stops the render-loop
+            # thread, and unlink()s the img2display SharedMemory block. Without
+            # this the leaked shared-memory segment + zmq resources keep the
+            # process from exiting after the viewer window closes.
+            if tele_source is not None and hasattr(tele_source, "close"):
+                try:
+                    tele_source.close()
+                except Exception as e:
+                    print(f"teleop: tele_source.close() raised {e!r} (ignored)")
+
+    # tell __main__ whether televuer was in play (see the hard-exit note there)
+    return tele_source is not None
+
+if __name__ == "__main__":
+    # televuer spawns its own server as a child process. Python's multiprocessing
+    # DEFAULT start method on macOS is "spawn" (full pickling of everything handed
+    # to the child) -- Linux defaults to "fork" (copies process memory directly, no
+    # pickling needed), which is almost certainly what televuer was only ever
+    # tested against. On macOS this crashes with "cannot pickle '_thread.lock'
+    # object" the moment --teleop constructs TeleVuerWrapper. Force "fork" here,
+    # before any Process gets created, to match what televuer actually needs --
+    # untested beyond fixing this specific crash; if --teleop still misbehaves
+    # after this, that's a new, separate issue, not this one.
+    import multiprocessing
+    try:
+        multiprocessing.set_start_method("fork")
+    except RuntimeError:
+        pass  # already set (e.g. re-imported) -- fine, don't fail on it
+    used_televuer = main()
+    if used_televuer:
+        # Even after TeleVuerWrapper.close(), the televuer/vuer child + macOS
+        # "fork" start method can leave this process wedged at interpreter
+        # shutdown (leaked SharedMemory / zmq / an unjoinable native thread),
+        # so it never returns to the shell. All of our own cleanup and prints
+        # have already run in main()'s finally, so exit hard instead of hanging.
+        import sys
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)

@@ -1,0 +1,382 @@
+<mujoco model="g1 fixed upper + table">
+  <include file="g1_planar_base.xml"/>
+  <statistic center="0.3 0 0.9" extent="1.4"/>
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.2 0.2 0.2" specular="0 0 0"/>
+    <global azimuth="120" elevation="-15"/>
+  </visual>
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="512"/>
+    <texture type="2d" name="grid" builtin="checker" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+             markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="grid" texture="grid" texuniform="true" texrepeat="5 5" reflectance="0.15"/>
+    <material name="wood" rgba="0.66 0.48 0.30 1"/>
+    <material name="plaex_yellow" rgba="1 0.9 0 1"/>
+    <!-- yellowPLAEXLong.obj from BRICK-SIMULATOR-3D-MUJOCO/BlenderFiles, raw Blender export
+         (Y-up). Raw mesh AABB = 5.25 x 2.30 x 2.50 units (mesh-local X,Y,Z).
+         scale=0.035 -> 18.375 x 8.05 x 8.75 cm (mesh-local X,Y,Z). After each
+         brick's +90deg-about-X visual correction quat, an un-yawed brick sits on
+         the table as L x W x H = 18.375 (world X, toward robot) x 8.75 (world Y,
+         lateral) x 8.05 (world Z, height) cm; the collision box matches. ENLARGED
+         AGAIN 2026-09-17 from scale=0.025 (13.125 x 5.75 x 6.25 cm world L x H x W --
+         itself an earlier enlargement from the original scale=0.015, 7.875 x 3.45 x
+         3.75 cm mesh-local; a scale=0.030 attempt the same day was reverted at the
+         user's request) to continue testing whether the bricks are graspable under
+         VR teleop -- see CLAUDE.md "Brick Assets". The source project's own 0.1
+         m/unit dam-building convention is unrelated and not used here. -->
+    <mesh name="yellow_plaex_long" file="yellowPLAEXLong.obj" scale="0.035 0.035 0.035"/>
+  </asset>
+  <worldbody>
+    <geom name="floor" size="0 0 0.05" type="plane" material="grid"/>
+    <!-- Table in front of the robot (robot forward = +X). Top surface at z=0.74 -->
+    <body name="table" pos="0.55 0 0">
+      <geom name="table_top" type="box" size="0.35 0.5 0.02" pos="0 0 0.72" material="wood"/>
+      <geom name="leg1" type="box" size="0.03 0.03 0.36" pos="0.30 0.45 0.36" material="wood"/>
+      <geom name="leg2" type="box" size="0.03 0.03 0.36" pos="0.30 -0.45 0.36" material="wood"/>
+      <geom name="leg3" type="box" size="0.03 0.03 0.36" pos="-0.30 0.45 0.36" material="wood"/>
+      <geom name="leg4" type="box" size="0.03 0.03 0.36" pos="-0.30 -0.45 0.36" material="wood"/>
+    </body>
+
+    <!-- Three yellowPLAEXLong bricks resting on the table (top at z=0.74), side by
+         side along Y, each at a different yaw so they aren't just a repeated
+         copy-paste row. Free bodies for teleop pick/stack.
+         x=0.28 (not the table's visual center) -- verify_arm_ik.py's reachability
+         check found the arm's true max reach is ~0.499 m (joint-limited, measured,
+         less than the naive fully-outstretched estimate of 0.530 m), and x=0.45
+         put targets at ~0.56 m from the shoulder: physically outside the arm's
+         workspace, confirmed by the IK solver saturating exactly at max reach
+         along the line to the target. x=0.28 puts all three ~0.43-0.44 m out,
+         with margin under 0.499 m. Re-run verify_arm_ik.py if bricks move again.
+         brick2's y moved from 0 (dead center) to -0.07: at y=0, reaching it
+         required the right (or left) shoulder to rotate across the body's own
+         centerline, producing a real torso/shoulder self-collision for BOTH
+         arms and leaving the physically-simulated gripper site ~4.4cm off
+         target (vs a 2cm tolerance) even though the IK solve itself converged
+         fine -- confirmed the pregrasp height wasn't the cause (self-collision
+         persisted up to 20cm above the brick) and that only a lateral shift
+         resolved it. At y=-0.07 the right arm reaches it with the self-collision
+         gone and ~1.6cm error. See CLAUDE.md's "Arm IK" section.
+         brick1's y moved -0.15 -> -0.20 (scale=0.025) -> -0.235 (scale=0.035,
+         2026-09-17): at scale=0.035 the previous -0.20 overlapped brick2 outright
+         (checked with a proper oriented-box test, not a half-width sum, since
+         brick2 is yawed 90deg) -- -0.235 restores a ~2.9cm gap. brick2 kept at
+         -0.07 (moving it toward centre reopens the self-collision above). Re-run
+         verify_arm_ik.py whenever brick1 moves -- its pick target moves with it.
+         The mesh's local axes need a fixed +90deg-about-X correction (Blender Y-up
+         -> MuJoCo Z-up, see BRICK-SIMULATOR-3D-MUJOCO/CLAUDE.md); expressed as a
+         quat (not euler) because this document's compiler angle="radian" and a
+         quat sidesteps any degrees/radians ambiguity. Body quat carries the yaw.
+
+         Each brick's collision geom carries friction="3 0.5 0.3" solref="0.005 1",
+         matching the Dex3-1 fingertip geoms tuned in make_fixed_base.py -- the two
+         sides of the same contact pair, tuned together against a real grasp+lift+hold
+         test (verify_grasp_hold.py), not independently. See CLAUDE.md's "Grasp
+         Primitive" section. -->
+    <!-- DOVETAIL COLLISION (2026-09-19): each brick's collision is no longer one box. It is a
+         `brickN_collision` main box (x from the tab base to the slot back wall, studs in the height,
+         as before) + a stepped-dovetail TAB on the -X end (head 0.5u wide at the tip, neck 0.25u, u =
+         0.035 m, 8.75 mm deep) + two stepped JAWS on the +X end forming the matching slot (through the
+         full height, 0.25u-wide neck at the face, 0.5u-wide inside). The head is wider than the neck, so
+         a neighbour's tab can only be LOWERED in from above; once in, the geometry itself blocks
+         sliding apart (no weld). Same overall envelope as the old box (x -2.75u..2.5u, y +/-1.25u).
+         Collision clearance is deliberately looser than the visual mesh's ~1 mm: 2.5 mm per side
+         laterally, 2 mm axially, so a human can line it up. Regenerate by editing the numbers in
+         CLAUDE.md "Brick Snap-Fit -> Dovetail" (they were generated by a script, not hand-typed). -->
+<!-- POOL:BODIES BEGIN -->
+    <!-- BRICK POOL (generated by make_brick_pool.py): brick1-3 on the table, brick4-13 spares
+         parked at x=-30 and frozen by the park_brickK welds until brick_spawner.py spawns them. -->
+    <body name="brick1" pos="0.28 -0.235 0.78025">
+      <freejoint/>
+      <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
+            quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
+      <geom name="brick1_collision" type="box" size="0.082125 0.04375 0.04025" pos="-0.005375 0 0.00525" density="640" group="3" contype="2" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick1_jaw_in_l" type="box" size="0.004187 0.011875 0.035" pos="0.080938 0.031875 0" density="640" group="3" contype="2" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick1_jaw_out_l" type="box" size="0.000688 0.01625 0.035" pos="0.085813 0.0275 0" density="640" group="3" contype="2" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick1_jaw_in_r" type="box" size="0.004187 0.011875 0.035" pos="0.080938 -0.031875 0" density="640" group="3" contype="2" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick1_jaw_out_r" type="box" size="0.000688 0.01625 0.035" pos="0.085813 -0.0275 0" density="640" group="3" contype="2" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick1_tab_head" type="box" size="0.002188 0.0175 0.035" pos="-0.094063 0 0" density="640" group="3" contype="2" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick1_tab_neck" type="box" size="0.002188 0.00875 0.035" pos="-0.089688 0 0" density="640" group="3" contype="2" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+    </body>
+    <body name="brick2" pos="0.28 -0.07 0.78025" quat="0.7071068 0 0 0.7071068">
+      <freejoint/>
+      <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
+            quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
+      <geom name="brick2_collision" type="box" size="0.082125 0.04375 0.04025" pos="-0.005375 0 0.00525" density="640" group="3" contype="4" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick2_jaw_in_l" type="box" size="0.004187 0.011875 0.035" pos="0.080938 0.031875 0" density="640" group="3" contype="4" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick2_jaw_out_l" type="box" size="0.000688 0.01625 0.035" pos="0.085813 0.0275 0" density="640" group="3" contype="4" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick2_jaw_in_r" type="box" size="0.004187 0.011875 0.035" pos="0.080938 -0.031875 0" density="640" group="3" contype="4" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick2_jaw_out_r" type="box" size="0.000688 0.01625 0.035" pos="0.085813 -0.0275 0" density="640" group="3" contype="4" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick2_tab_head" type="box" size="0.002188 0.0175 0.035" pos="-0.094063 0 0" density="640" group="3" contype="4" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick2_tab_neck" type="box" size="0.002188 0.00875 0.035" pos="-0.089688 0 0" density="640" group="3" contype="4" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+    </body>
+    <body name="brick3" pos="0.28 0.15 0.78025" quat="0.9659258 0 0 0.258819">
+      <freejoint/>
+      <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
+            quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
+      <geom name="brick3_collision" type="box" size="0.082125 0.04375 0.04025" pos="-0.005375 0 0.00525" density="640" group="3" contype="8" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick3_jaw_in_l" type="box" size="0.004187 0.011875 0.035" pos="0.080938 0.031875 0" density="640" group="3" contype="8" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick3_jaw_out_l" type="box" size="0.000688 0.01625 0.035" pos="0.085813 0.0275 0" density="640" group="3" contype="8" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick3_jaw_in_r" type="box" size="0.004187 0.011875 0.035" pos="0.080938 -0.031875 0" density="640" group="3" contype="8" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick3_jaw_out_r" type="box" size="0.000688 0.01625 0.035" pos="0.085813 -0.0275 0" density="640" group="3" contype="8" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick3_tab_head" type="box" size="0.002188 0.0175 0.035" pos="-0.094063 0 0" density="640" group="3" contype="8" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick3_tab_neck" type="box" size="0.002188 0.00875 0.035" pos="-0.089688 0 0" density="640" group="3" contype="8" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+    </body>
+    <body name="brick4" pos="-30 -4.5 1">
+      <freejoint/>
+      <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
+            quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
+      <geom name="brick4_collision" type="box" size="0.082125 0.04375 0.04025" pos="-0.005375 0 0.00525" density="640" group="3" contype="16" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick4_jaw_in_l" type="box" size="0.004187 0.011875 0.035" pos="0.080938 0.031875 0" density="640" group="3" contype="16" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick4_jaw_out_l" type="box" size="0.000688 0.01625 0.035" pos="0.085813 0.0275 0" density="640" group="3" contype="16" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick4_jaw_in_r" type="box" size="0.004187 0.011875 0.035" pos="0.080938 -0.031875 0" density="640" group="3" contype="16" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick4_jaw_out_r" type="box" size="0.000688 0.01625 0.035" pos="0.085813 -0.0275 0" density="640" group="3" contype="16" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick4_tab_head" type="box" size="0.002188 0.0175 0.035" pos="-0.094063 0 0" density="640" group="3" contype="16" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick4_tab_neck" type="box" size="0.002188 0.00875 0.035" pos="-0.089688 0 0" density="640" group="3" contype="16" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+    </body>
+    <body name="brick5" pos="-30 -3.5 1">
+      <freejoint/>
+      <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
+            quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
+      <geom name="brick5_collision" type="box" size="0.082125 0.04375 0.04025" pos="-0.005375 0 0.00525" density="640" group="3" contype="32" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick5_jaw_in_l" type="box" size="0.004187 0.011875 0.035" pos="0.080938 0.031875 0" density="640" group="3" contype="32" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick5_jaw_out_l" type="box" size="0.000688 0.01625 0.035" pos="0.085813 0.0275 0" density="640" group="3" contype="32" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick5_jaw_in_r" type="box" size="0.004187 0.011875 0.035" pos="0.080938 -0.031875 0" density="640" group="3" contype="32" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick5_jaw_out_r" type="box" size="0.000688 0.01625 0.035" pos="0.085813 -0.0275 0" density="640" group="3" contype="32" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick5_tab_head" type="box" size="0.002188 0.0175 0.035" pos="-0.094063 0 0" density="640" group="3" contype="32" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick5_tab_neck" type="box" size="0.002188 0.00875 0.035" pos="-0.089688 0 0" density="640" group="3" contype="32" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+    </body>
+    <body name="brick6" pos="-30 -2.5 1">
+      <freejoint/>
+      <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
+            quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
+      <geom name="brick6_collision" type="box" size="0.082125 0.04375 0.04025" pos="-0.005375 0 0.00525" density="640" group="3" contype="64" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick6_jaw_in_l" type="box" size="0.004187 0.011875 0.035" pos="0.080938 0.031875 0" density="640" group="3" contype="64" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick6_jaw_out_l" type="box" size="0.000688 0.01625 0.035" pos="0.085813 0.0275 0" density="640" group="3" contype="64" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick6_jaw_in_r" type="box" size="0.004187 0.011875 0.035" pos="0.080938 -0.031875 0" density="640" group="3" contype="64" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick6_jaw_out_r" type="box" size="0.000688 0.01625 0.035" pos="0.085813 -0.0275 0" density="640" group="3" contype="64" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick6_tab_head" type="box" size="0.002188 0.0175 0.035" pos="-0.094063 0 0" density="640" group="3" contype="64" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick6_tab_neck" type="box" size="0.002188 0.00875 0.035" pos="-0.089688 0 0" density="640" group="3" contype="64" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+    </body>
+    <body name="brick7" pos="-30 -1.5 1">
+      <freejoint/>
+      <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
+            quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
+      <geom name="brick7_collision" type="box" size="0.082125 0.04375 0.04025" pos="-0.005375 0 0.00525" density="640" group="3" contype="128" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick7_jaw_in_l" type="box" size="0.004187 0.011875 0.035" pos="0.080938 0.031875 0" density="640" group="3" contype="128" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick7_jaw_out_l" type="box" size="0.000688 0.01625 0.035" pos="0.085813 0.0275 0" density="640" group="3" contype="128" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick7_jaw_in_r" type="box" size="0.004187 0.011875 0.035" pos="0.080938 -0.031875 0" density="640" group="3" contype="128" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick7_jaw_out_r" type="box" size="0.000688 0.01625 0.035" pos="0.085813 -0.0275 0" density="640" group="3" contype="128" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick7_tab_head" type="box" size="0.002188 0.0175 0.035" pos="-0.094063 0 0" density="640" group="3" contype="128" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick7_tab_neck" type="box" size="0.002188 0.00875 0.035" pos="-0.089688 0 0" density="640" group="3" contype="128" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+    </body>
+    <body name="brick8" pos="-30 -0.5 1">
+      <freejoint/>
+      <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
+            quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
+      <geom name="brick8_collision" type="box" size="0.082125 0.04375 0.04025" pos="-0.005375 0 0.00525" density="640" group="3" contype="256" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick8_jaw_in_l" type="box" size="0.004187 0.011875 0.035" pos="0.080938 0.031875 0" density="640" group="3" contype="256" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick8_jaw_out_l" type="box" size="0.000688 0.01625 0.035" pos="0.085813 0.0275 0" density="640" group="3" contype="256" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick8_jaw_in_r" type="box" size="0.004187 0.011875 0.035" pos="0.080938 -0.031875 0" density="640" group="3" contype="256" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick8_jaw_out_r" type="box" size="0.000688 0.01625 0.035" pos="0.085813 -0.0275 0" density="640" group="3" contype="256" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick8_tab_head" type="box" size="0.002188 0.0175 0.035" pos="-0.094063 0 0" density="640" group="3" contype="256" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick8_tab_neck" type="box" size="0.002188 0.00875 0.035" pos="-0.089688 0 0" density="640" group="3" contype="256" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+    </body>
+    <body name="brick9" pos="-30 0.5 1">
+      <freejoint/>
+      <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
+            quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
+      <geom name="brick9_collision" type="box" size="0.082125 0.04375 0.04025" pos="-0.005375 0 0.00525" density="640" group="3" contype="512" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick9_jaw_in_l" type="box" size="0.004187 0.011875 0.035" pos="0.080938 0.031875 0" density="640" group="3" contype="512" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick9_jaw_out_l" type="box" size="0.000688 0.01625 0.035" pos="0.085813 0.0275 0" density="640" group="3" contype="512" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick9_jaw_in_r" type="box" size="0.004187 0.011875 0.035" pos="0.080938 -0.031875 0" density="640" group="3" contype="512" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick9_jaw_out_r" type="box" size="0.000688 0.01625 0.035" pos="0.085813 -0.0275 0" density="640" group="3" contype="512" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick9_tab_head" type="box" size="0.002188 0.0175 0.035" pos="-0.094063 0 0" density="640" group="3" contype="512" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick9_tab_neck" type="box" size="0.002188 0.00875 0.035" pos="-0.089688 0 0" density="640" group="3" contype="512" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+    </body>
+    <body name="brick10" pos="-30 1.5 1">
+      <freejoint/>
+      <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
+            quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
+      <geom name="brick10_collision" type="box" size="0.082125 0.04375 0.04025" pos="-0.005375 0 0.00525" density="640" group="3" contype="1024" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick10_jaw_in_l" type="box" size="0.004187 0.011875 0.035" pos="0.080938 0.031875 0" density="640" group="3" contype="1024" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick10_jaw_out_l" type="box" size="0.000688 0.01625 0.035" pos="0.085813 0.0275 0" density="640" group="3" contype="1024" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick10_jaw_in_r" type="box" size="0.004187 0.011875 0.035" pos="0.080938 -0.031875 0" density="640" group="3" contype="1024" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick10_jaw_out_r" type="box" size="0.000688 0.01625 0.035" pos="0.085813 -0.0275 0" density="640" group="3" contype="1024" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick10_tab_head" type="box" size="0.002188 0.0175 0.035" pos="-0.094063 0 0" density="640" group="3" contype="1024" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick10_tab_neck" type="box" size="0.002188 0.00875 0.035" pos="-0.089688 0 0" density="640" group="3" contype="1024" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+    </body>
+    <body name="brick11" pos="-30 2.5 1">
+      <freejoint/>
+      <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
+            quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
+      <geom name="brick11_collision" type="box" size="0.082125 0.04375 0.04025" pos="-0.005375 0 0.00525" density="640" group="3" contype="2048" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick11_jaw_in_l" type="box" size="0.004187 0.011875 0.035" pos="0.080938 0.031875 0" density="640" group="3" contype="2048" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick11_jaw_out_l" type="box" size="0.000688 0.01625 0.035" pos="0.085813 0.0275 0" density="640" group="3" contype="2048" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick11_jaw_in_r" type="box" size="0.004187 0.011875 0.035" pos="0.080938 -0.031875 0" density="640" group="3" contype="2048" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick11_jaw_out_r" type="box" size="0.000688 0.01625 0.035" pos="0.085813 -0.0275 0" density="640" group="3" contype="2048" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick11_tab_head" type="box" size="0.002188 0.0175 0.035" pos="-0.094063 0 0" density="640" group="3" contype="2048" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick11_tab_neck" type="box" size="0.002188 0.00875 0.035" pos="-0.089688 0 0" density="640" group="3" contype="2048" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+    </body>
+    <body name="brick12" pos="-30 3.5 1">
+      <freejoint/>
+      <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
+            quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
+      <geom name="brick12_collision" type="box" size="0.082125 0.04375 0.04025" pos="-0.005375 0 0.00525" density="640" group="3" contype="4096" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick12_jaw_in_l" type="box" size="0.004187 0.011875 0.035" pos="0.080938 0.031875 0" density="640" group="3" contype="4096" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick12_jaw_out_l" type="box" size="0.000688 0.01625 0.035" pos="0.085813 0.0275 0" density="640" group="3" contype="4096" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick12_jaw_in_r" type="box" size="0.004187 0.011875 0.035" pos="0.080938 -0.031875 0" density="640" group="3" contype="4096" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick12_jaw_out_r" type="box" size="0.000688 0.01625 0.035" pos="0.085813 -0.0275 0" density="640" group="3" contype="4096" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick12_tab_head" type="box" size="0.002188 0.0175 0.035" pos="-0.094063 0 0" density="640" group="3" contype="4096" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick12_tab_neck" type="box" size="0.002188 0.00875 0.035" pos="-0.089688 0 0" density="640" group="3" contype="4096" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+    </body>
+    <body name="brick13" pos="-30 4.5 1">
+      <freejoint/>
+      <geom type="mesh" mesh="yellow_plaex_long" material="plaex_yellow"
+            quat="0.7071068 0.7071068 0 0" contype="0" conaffinity="0" density="0" group="2"/>
+      <geom name="brick13_collision" type="box" size="0.082125 0.04375 0.04025" pos="-0.005375 0 0.00525" density="640" group="3" contype="8192" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick13_jaw_in_l" type="box" size="0.004187 0.011875 0.035" pos="0.080938 0.031875 0" density="640" group="3" contype="8192" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick13_jaw_out_l" type="box" size="0.000688 0.01625 0.035" pos="0.085813 0.0275 0" density="640" group="3" contype="8192" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick13_jaw_in_r" type="box" size="0.004187 0.011875 0.035" pos="0.080938 -0.031875 0" density="640" group="3" contype="8192" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick13_jaw_out_r" type="box" size="0.000688 0.01625 0.035" pos="0.085813 -0.0275 0" density="640" group="3" contype="8192" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick13_tab_head" type="box" size="0.002188 0.0175 0.035" pos="-0.094063 0 0" density="640" group="3" contype="8192" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+      <geom name="brick13_tab_neck" type="box" size="0.002188 0.00875 0.035" pos="-0.089688 0 0" density="640" group="3" contype="8192" conaffinity="16383" friction="3 0.5 0.3" solref="0.005 1"/>
+    </body>
+    <!-- POOL:BODIES END -->
+  </worldbody>
+
+  <!-- Stud/groove snap-fit welds (brick_snap.py). One INACTIVE weld per brick pair: MuJoCo
+       can't add constraints at runtime, so every possible pairing is pre-declared and
+       brick_snap.BrickSnapper activates the right one (writing its relative pose into
+       eq_data first) when a brick comes to rest on another within snap tolerance, and
+       deactivates it when pulled off. Each brick's collision geom also carries its own contype bit (2,4,8,16,32) and conaffinity=63
+       (= 1|all brick bits) instead of the default 1/1: robot, table and floor (1/1) still collide with
+       every brick exactly as before, and brick-brick collision is unchanged UNTIL the snapper clears a
+       seated pair's bits -- needed because the seated pose puts the two collision boxes 10.5 mm
+       inside each other (a plain box has no grooves), which contact would otherwise fight the weld
+       over. Inactive welds + untouched masks = zero effect on the simulation, so scenes
+       and verify_*.py scripts that never construct a BrickSnapper behave exactly as before. -->
+  <equality>
+    <!-- POOL:EQUALITY BEGIN -->
+    <!-- one inactive stud-snap weld per pair (brick_snap.py), then the parking welds -->
+    <weld name="snap_brick1_brick2" body1="brick1" body2="brick2" active="false" solref="0.004 1"/>
+    <weld name="snap_brick1_brick3" body1="brick1" body2="brick3" active="false" solref="0.004 1"/>
+    <weld name="snap_brick1_brick4" body1="brick1" body2="brick4" active="false" solref="0.004 1"/>
+    <weld name="snap_brick1_brick5" body1="brick1" body2="brick5" active="false" solref="0.004 1"/>
+    <weld name="snap_brick1_brick6" body1="brick1" body2="brick6" active="false" solref="0.004 1"/>
+    <weld name="snap_brick1_brick7" body1="brick1" body2="brick7" active="false" solref="0.004 1"/>
+    <weld name="snap_brick1_brick8" body1="brick1" body2="brick8" active="false" solref="0.004 1"/>
+    <weld name="snap_brick1_brick9" body1="brick1" body2="brick9" active="false" solref="0.004 1"/>
+    <weld name="snap_brick1_brick10" body1="brick1" body2="brick10" active="false" solref="0.004 1"/>
+    <weld name="snap_brick1_brick11" body1="brick1" body2="brick11" active="false" solref="0.004 1"/>
+    <weld name="snap_brick1_brick12" body1="brick1" body2="brick12" active="false" solref="0.004 1"/>
+    <weld name="snap_brick1_brick13" body1="brick1" body2="brick13" active="false" solref="0.004 1"/>
+    <weld name="snap_brick2_brick3" body1="brick2" body2="brick3" active="false" solref="0.004 1"/>
+    <weld name="snap_brick2_brick4" body1="brick2" body2="brick4" active="false" solref="0.004 1"/>
+    <weld name="snap_brick2_brick5" body1="brick2" body2="brick5" active="false" solref="0.004 1"/>
+    <weld name="snap_brick2_brick6" body1="brick2" body2="brick6" active="false" solref="0.004 1"/>
+    <weld name="snap_brick2_brick7" body1="brick2" body2="brick7" active="false" solref="0.004 1"/>
+    <weld name="snap_brick2_brick8" body1="brick2" body2="brick8" active="false" solref="0.004 1"/>
+    <weld name="snap_brick2_brick9" body1="brick2" body2="brick9" active="false" solref="0.004 1"/>
+    <weld name="snap_brick2_brick10" body1="brick2" body2="brick10" active="false" solref="0.004 1"/>
+    <weld name="snap_brick2_brick11" body1="brick2" body2="brick11" active="false" solref="0.004 1"/>
+    <weld name="snap_brick2_brick12" body1="brick2" body2="brick12" active="false" solref="0.004 1"/>
+    <weld name="snap_brick2_brick13" body1="brick2" body2="brick13" active="false" solref="0.004 1"/>
+    <weld name="snap_brick3_brick4" body1="brick3" body2="brick4" active="false" solref="0.004 1"/>
+    <weld name="snap_brick3_brick5" body1="brick3" body2="brick5" active="false" solref="0.004 1"/>
+    <weld name="snap_brick3_brick6" body1="brick3" body2="brick6" active="false" solref="0.004 1"/>
+    <weld name="snap_brick3_brick7" body1="brick3" body2="brick7" active="false" solref="0.004 1"/>
+    <weld name="snap_brick3_brick8" body1="brick3" body2="brick8" active="false" solref="0.004 1"/>
+    <weld name="snap_brick3_brick9" body1="brick3" body2="brick9" active="false" solref="0.004 1"/>
+    <weld name="snap_brick3_brick10" body1="brick3" body2="brick10" active="false" solref="0.004 1"/>
+    <weld name="snap_brick3_brick11" body1="brick3" body2="brick11" active="false" solref="0.004 1"/>
+    <weld name="snap_brick3_brick12" body1="brick3" body2="brick12" active="false" solref="0.004 1"/>
+    <weld name="snap_brick3_brick13" body1="brick3" body2="brick13" active="false" solref="0.004 1"/>
+    <weld name="snap_brick4_brick5" body1="brick4" body2="brick5" active="false" solref="0.004 1"/>
+    <weld name="snap_brick4_brick6" body1="brick4" body2="brick6" active="false" solref="0.004 1"/>
+    <weld name="snap_brick4_brick7" body1="brick4" body2="brick7" active="false" solref="0.004 1"/>
+    <weld name="snap_brick4_brick8" body1="brick4" body2="brick8" active="false" solref="0.004 1"/>
+    <weld name="snap_brick4_brick9" body1="brick4" body2="brick9" active="false" solref="0.004 1"/>
+    <weld name="snap_brick4_brick10" body1="brick4" body2="brick10" active="false" solref="0.004 1"/>
+    <weld name="snap_brick4_brick11" body1="brick4" body2="brick11" active="false" solref="0.004 1"/>
+    <weld name="snap_brick4_brick12" body1="brick4" body2="brick12" active="false" solref="0.004 1"/>
+    <weld name="snap_brick4_brick13" body1="brick4" body2="brick13" active="false" solref="0.004 1"/>
+    <weld name="snap_brick5_brick6" body1="brick5" body2="brick6" active="false" solref="0.004 1"/>
+    <weld name="snap_brick5_brick7" body1="brick5" body2="brick7" active="false" solref="0.004 1"/>
+    <weld name="snap_brick5_brick8" body1="brick5" body2="brick8" active="false" solref="0.004 1"/>
+    <weld name="snap_brick5_brick9" body1="brick5" body2="brick9" active="false" solref="0.004 1"/>
+    <weld name="snap_brick5_brick10" body1="brick5" body2="brick10" active="false" solref="0.004 1"/>
+    <weld name="snap_brick5_brick11" body1="brick5" body2="brick11" active="false" solref="0.004 1"/>
+    <weld name="snap_brick5_brick12" body1="brick5" body2="brick12" active="false" solref="0.004 1"/>
+    <weld name="snap_brick5_brick13" body1="brick5" body2="brick13" active="false" solref="0.004 1"/>
+    <weld name="snap_brick6_brick7" body1="brick6" body2="brick7" active="false" solref="0.004 1"/>
+    <weld name="snap_brick6_brick8" body1="brick6" body2="brick8" active="false" solref="0.004 1"/>
+    <weld name="snap_brick6_brick9" body1="brick6" body2="brick9" active="false" solref="0.004 1"/>
+    <weld name="snap_brick6_brick10" body1="brick6" body2="brick10" active="false" solref="0.004 1"/>
+    <weld name="snap_brick6_brick11" body1="brick6" body2="brick11" active="false" solref="0.004 1"/>
+    <weld name="snap_brick6_brick12" body1="brick6" body2="brick12" active="false" solref="0.004 1"/>
+    <weld name="snap_brick6_brick13" body1="brick6" body2="brick13" active="false" solref="0.004 1"/>
+    <weld name="snap_brick7_brick8" body1="brick7" body2="brick8" active="false" solref="0.004 1"/>
+    <weld name="snap_brick7_brick9" body1="brick7" body2="brick9" active="false" solref="0.004 1"/>
+    <weld name="snap_brick7_brick10" body1="brick7" body2="brick10" active="false" solref="0.004 1"/>
+    <weld name="snap_brick7_brick11" body1="brick7" body2="brick11" active="false" solref="0.004 1"/>
+    <weld name="snap_brick7_brick12" body1="brick7" body2="brick12" active="false" solref="0.004 1"/>
+    <weld name="snap_brick7_brick13" body1="brick7" body2="brick13" active="false" solref="0.004 1"/>
+    <weld name="snap_brick8_brick9" body1="brick8" body2="brick9" active="false" solref="0.004 1"/>
+    <weld name="snap_brick8_brick10" body1="brick8" body2="brick10" active="false" solref="0.004 1"/>
+    <weld name="snap_brick8_brick11" body1="brick8" body2="brick11" active="false" solref="0.004 1"/>
+    <weld name="snap_brick8_brick12" body1="brick8" body2="brick12" active="false" solref="0.004 1"/>
+    <weld name="snap_brick8_brick13" body1="brick8" body2="brick13" active="false" solref="0.004 1"/>
+    <weld name="snap_brick9_brick10" body1="brick9" body2="brick10" active="false" solref="0.004 1"/>
+    <weld name="snap_brick9_brick11" body1="brick9" body2="brick11" active="false" solref="0.004 1"/>
+    <weld name="snap_brick9_brick12" body1="brick9" body2="brick12" active="false" solref="0.004 1"/>
+    <weld name="snap_brick9_brick13" body1="brick9" body2="brick13" active="false" solref="0.004 1"/>
+    <weld name="snap_brick10_brick11" body1="brick10" body2="brick11" active="false" solref="0.004 1"/>
+    <weld name="snap_brick10_brick12" body1="brick10" body2="brick12" active="false" solref="0.004 1"/>
+    <weld name="snap_brick10_brick13" body1="brick10" body2="brick13" active="false" solref="0.004 1"/>
+    <weld name="snap_brick11_brick12" body1="brick11" body2="brick12" active="false" solref="0.004 1"/>
+    <weld name="snap_brick11_brick13" body1="brick11" body2="brick13" active="false" solref="0.004 1"/>
+    <weld name="snap_brick12_brick13" body1="brick12" body2="brick13" active="false" solref="0.004 1"/>
+    <!-- parked spares: weld to world (body2 omitted); the anchor MUST be the parking position (the default
+         anchor 0 0 0 leaves the weld holding nothing -- the brick just falls) -->
+    <weld name="park_brick4" body1="brick4" anchor="-30 -4.5 1" active="true"/>
+    <weld name="park_brick5" body1="brick5" anchor="-30 -3.5 1" active="true"/>
+    <weld name="park_brick6" body1="brick6" anchor="-30 -2.5 1" active="true"/>
+    <weld name="park_brick7" body1="brick7" anchor="-30 -1.5 1" active="true"/>
+    <weld name="park_brick8" body1="brick8" anchor="-30 -0.5 1" active="true"/>
+    <weld name="park_brick9" body1="brick9" anchor="-30 0.5 1" active="true"/>
+    <weld name="park_brick10" body1="brick10" anchor="-30 1.5 1" active="true"/>
+    <weld name="park_brick11" body1="brick11" anchor="-30 2.5 1" active="true"/>
+    <weld name="park_brick12" body1="brick12" anchor="-30 3.5 1" active="true"/>
+    <weld name="park_brick13" body1="brick13" anchor="-30 4.5 1" active="true"/>
+    <!-- POOL:EQUALITY END -->
+  </equality>
+
+  <!-- g1_fixed_upper.xml's own "stand" keyframe is robot-only (43 qpos values,
+       g1_with_hands.xml source: 29 body + 14 Dex3-1 finger joints). MuJoCo
+       auto-pads it to this scene's nq (78, with all five bricks) with
+       zero/identity for the brick free joints, which resets every brick to
+       the world origin -- not the table. This keyframe gives the full scene
+       (robot + 5 bricks) a correct reset point; stand_next_to_table.py looks
+       it up by name instead of index 0. Robot qpos/ctrl values copied
+       verbatim from g1_fixed_upper.xml's "stand". qpos length must always
+       equal nq (see CLAUDE.md's "Generation Pipeline & Hard Invariants") --
+       this grew from 64 to 78 with brick4/brick5's addition. -->
+  <keyframe>
+    <key name="stand_at_table"
+      qpos="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.2 0.2 0 1.28 0 0 0 0 1.05 0 0 0 0 0 0.2 -0.2 0 1.28 0 0 0 0 -1.05 0 0 0 0 0
+            0.28 -0.235 0.78025 1 0 0 0
+            0.28 -0.07 0.78025 0.7071068 0 0 0.7071068
+            0.28 0.15 0.78025 0.9659258 0 0 0.258819
+            -30 -4.5 1 1 0 0 0
+            -30 -3.5 1 1 0 0 0
+            -30 -2.5 1 1 0 0 0
+            -30 -1.5 1 1 0 0 0
+            -30 -0.5 1 1 0 0 0
+            -30 0.5 1 1 0 0 0
+            -30 1.5 1 1 0 0 0
+            -30 2.5 1 1 0 0 0
+            -30 3.5 1 1 0 0 0
+            -30 4.5 1 1 0 0 0"
+      ctrl="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.2 0.2 0 1.28 0 0 0 0 1.05 0 0 0 0 0 0.2 -0.2 0 1.28 0 0 0 0 -1.05 0 0 0 0 0"/>
+  </keyframe>
+</mujoco>
